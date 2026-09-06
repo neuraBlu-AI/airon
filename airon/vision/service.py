@@ -18,8 +18,11 @@ from .camera import OakCamera, sample_distance
 from .tracker import FaceTracker
 
 # How long a face may be missing before aiRon accepts that you have gone.
-# Haar detection drops frames when you turn your head; leaving takes longer.
-PRESENCE_GRACE_S = 1.2
+# Haar cascades only see faces looking roughly at the camera, so glancing away,
+# tilting your head or leaning out of frame all read as a dropped detection. At
+# 1.2 s that produced eleven "arrivals" in two minutes of one person sitting
+# still. Leaving a room genuinely takes longer than looking away does.
+PRESENCE_GRACE_S = 4.0
 
 # Eye contact needs hysteresis or a blink reads as looking away: enter the state
 # only once it has held, and leave it only after a sustained absence.

@@ -75,9 +75,12 @@ class FaceAnimator:
     and the current command, and never blocks on either.
     """
 
-    def __init__(self, mirror: bool = True):
+    def __init__(self, mirror: bool = True, speech=None):
         self.mirror = mirror
         self.command = FaceCommand()
+        # Optional speech_service. When it is talking, its audio envelope owns
+        # the mouth - whatever else the face is doing.
+        self.speech = speech
 
         self.gaze_x = 0.0
         self.gaze_y = 0.0
@@ -139,6 +142,13 @@ class FaceAnimator:
             self.brow_lift = approach(self.brow_lift, pose.brow_lift * gain, 6.0, dt)
             self.brow_angle = approach(self.brow_angle, pose.brow_angle * gain, 6.0, dt)
 
+        # Speech overrides both branches: aiRon's own voice beats copying you
+        # and beats the emotion pose, or it looks like a badly dubbed film.
+        if self.speech is not None and self.speech.speaking:
+            level = self.speech.level
+            self.mouth_open = approach(self.mouth_open, 0.10 + 0.90 * level, 24.0, dt)
+            self.mouth_curve = approach(self.mouth_curve, max(self.mouth_curve, 0.2), 5.0, dt)
+
         self.awake = approach(self.awake, 1.0, 1.5, dt)
 
     # ------------------------------------------------------------- idle life
@@ -166,7 +176,11 @@ class FaceAnimator:
         return abs(self._blink_phase - half) / half
 
     def _speech_mouth(self, pose: Emotion) -> float:
-        """Stand-in visemes until the speech service exists (spec section 10)."""
+        """
+        Fallback mouth motion for when there is no speech_service attached -
+        pressing S in the face window, mostly. With a service connected, the
+        real audio envelope in tick() overrides whatever this returns.
+        """
         if not self.command.speaking:
             return pose.mouth_open
         wobble = 0.5 + 0.5 * math.sin(self._t * 17.0) * math.sin(self._t * 6.3)

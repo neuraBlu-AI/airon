@@ -32,6 +32,8 @@ class EventType(str, Enum):
     # one that visibly goes to sleep.
     CAMERA_LOST = "CAMERA_LOST"
     CAMERA_READY = "CAMERA_READY"
+    SPEECH_STARTED = "SPEECH_STARTED"
+    SPEECH_FINISHED = "SPEECH_FINISHED"
 
 
 @dataclass
