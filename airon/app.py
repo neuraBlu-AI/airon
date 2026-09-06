@@ -17,7 +17,7 @@ import sys
 
 from PySide6.QtWidgets import QApplication
 
-from .core import EventBus, StateStore
+from .core import EventBus, EventType, StateStore
 from .face import FaceAnimator, FaceWindow
 from .vision import VisionService
 
@@ -33,6 +33,10 @@ def parse_args(argv=None):
     parser.add_argument("--no-mirror", action="store_true",
                         help="start in emotion mode instead of mirroring the human")
     parser.add_argument("--fps", type=int, default=30, help="camera frame rate")
+    parser.add_argument("--depth-fps", type=int, default=None,
+                        help="stereo frame rate (default 10; higher has crashed this device)")
+    parser.add_argument("--debug", action="store_true",
+                        help="start with the state overlay visible")
     return parser.parse_args(argv)
 
 
@@ -46,7 +50,8 @@ def main(argv=None) -> int:
     try:
         vision = VisionService(store, bus, fps=args.fps,
                                want_depth=not args.no_depth,
-                               force_depth=args.force_depth)
+                               force_depth=args.force_depth,
+                               depth_fps=args.depth_fps)
     except Exception as exc:
         print(f"[aiRon] vision failed to start: {exc}", file=sys.stderr)
         return 1
@@ -57,7 +62,19 @@ def main(argv=None) -> int:
 
     app = QApplication(sys.argv[:1])
     animator = FaceAnimator(mirror=not args.no_mirror)
+
+    def on_camera(event):
+        """Losing the camera should be visible on aiRon's face, not just in a log."""
+        if event.type is EventType.CAMERA_LOST:
+            animator.mirror = False
+            animator.command.emotion = "sleepy"
+        elif event.type is EventType.CAMERA_READY:
+            animator.command.emotion = "curious"
+            animator.mirror = not args.no_mirror
+
+    bus.subscribe(on_camera)
     window = FaceWindow(store, animator, vision=vision, fullscreen=not args.windowed)
+    window.show_debug = args.debug
     window.setWindowTitle("aiRon")
 
     try:

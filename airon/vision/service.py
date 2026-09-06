@@ -26,15 +26,22 @@ PRESENCE_GRACE_S = 1.2
 LOOK_ENTER_S = 0.25
 LOOK_EXIT_S = 1.0
 
+#: The OAK sometimes resets itself mid-run and comes back as its ROM
+#: bootloader. read() returns None rather than raising, so without a watchdog
+#: the vision thread spins forever on a device that is no longer there.
+STALL_TIMEOUT_S = 5.0
+RECONNECT_EVERY_S = 5.0
+
 
 class VisionService:
     def __init__(self, store: StateStore, bus: EventBus, *,
                  width: int = 640, height: int = 480, fps: int = 30,
-                 want_depth: bool = True, force_depth: bool = False):
+                 want_depth: bool = True, force_depth: bool = False,
+                 depth_fps: int | None = None):
         self.store = store
         self.bus = bus
         self.camera = OakCamera(width, height, fps, want_depth=want_depth,
-                                force_depth=force_depth)
+                                force_depth=force_depth, depth_fps=depth_fps)
         self.tracker = FaceTracker()
 
         self._ids = itertools.count(1)
@@ -46,6 +53,10 @@ class VisionService:
 
         self._thread = threading.Thread(target=self._run, name="vision", daemon=True)
         self._stop = threading.Event()
+        self.camera_ok = True
+        self._camera_args = dict(width=width, height=height, fps=fps,
+                                 want_depth=want_depth, force_depth=force_depth,
+                                 depth_fps=depth_fps)
 
         # Latest frame kept for tools/vision_bench.py. The face never reads it.
         self._lock = threading.Lock()
@@ -72,12 +83,18 @@ class VisionService:
 
     def _run(self) -> None:
         last = time.monotonic()
+        last_frame = time.monotonic()
         while not self._stop.is_set():
-            frame = self.camera.read()
+            frame = self.camera.read() if self.camera_ok else None
             if frame is None:
+                if self.camera_ok and time.monotonic() - last_frame > STALL_TIMEOUT_S:
+                    self._on_camera_lost()
+                elif not self.camera_ok:
+                    self._try_reconnect()
                 time.sleep(0.002)
                 continue
 
+            last_frame = time.monotonic()
             now = time.monotonic()
             dt = min(now - last, 0.1)
             last = now
@@ -88,6 +105,37 @@ class VisionService:
 
             with self._lock:
                 self._latest = (frame, obs)
+
+    def _on_camera_lost(self) -> None:
+        self.camera_ok = False
+        self.fps = 0.0
+        self._next_retry = time.monotonic() + RECONNECT_EVERY_S
+        print("[vision] camera stopped delivering frames - going blind, will retry")
+        self.bus.publish(EventType.CAMERA_LOST)
+        if self._person is not None:
+            self.bus.publish(EventType.PERSON_LEFT, person=self._person.id)
+            self._person = None
+        self.store.set(WorldState(timestamp=time.time()))
+        try:
+            self.camera.close()
+        except Exception:
+            pass
+
+    def _try_reconnect(self) -> None:
+        """Rebuild the pipeline from scratch. A reset OAK comes back as its ROM
+        bootloader, so this is a fresh boot, not a resumed connection."""
+        if time.monotonic() < self._next_retry:
+            return
+        self._next_retry = time.monotonic() + RECONNECT_EVERY_S
+        try:
+            self.camera = OakCamera(**self._camera_args)
+        except Exception as exc:
+            print(f"[vision] reconnect failed: {str(exc)[:90]}")
+            return
+        self.camera_ok = True
+        print(f"[vision] camera back: {self.camera.name}"
+              f"{' with depth' if self.camera.has_depth else ' (no depth)'}")
+        self.bus.publish(EventType.CAMERA_READY, depth=self.camera.has_depth)
 
     def _update_world(self, obs, frame, now: float) -> None:
         if obs.found:

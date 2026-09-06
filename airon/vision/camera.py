@@ -2,42 +2,33 @@
 aiRon's eyes: the Luxonis OAK-D Lite AF over USB 3, via DepthAI v3.
 
 The colour sensor gives the frame we detect faces in; the stereo pair gives
-real distance in metres. Depth is aligned onto the colour sensor so a face
-box found in the RGB image can be sampled directly in the depth image.
+real distance in metres. Depth is aligned onto the colour sensor and scaled to
+match it, so a face box found in the RGB image indexes straight into the depth
+image with no coordinate mapping.
+
+Both DepthAI APIs are supported, but they are not equivalent on this hardware:
+depthai 3.10 cannot get frames out of the OAK-D Lite's OV7251 mono sensors, so
+depth is only offered on v2. See requirements.txt for the evidence.
 """
 
 from __future__ import annotations
 
-import glob
 import time
 from dataclasses import dataclass, field
 
 import numpy as np
 
-#: Below this negotiated link speed the OAK-D Lite cannot run its stereo pair.
-USB3_MBPS = 5000
-
-
-def usb_link_speed_mbps() -> int | None:
-    """
-    Negotiated USB speed of the attached Movidius device, read from sysfs.
-
-    Checked before the device is opened. The OAK-D Lite draws more current with
-    three sensors active than a 500 mA USB 2.0 port provides, and it does not
-    degrade - it browns out and crashes, killing the colour stream too, and
-    depthai cannot rebuild a pipeline afterwards without terminating the
-    process. So the only safe move is to know the link speed up front.
-    """
-    for device in glob.glob("/sys/bus/usb/devices/*/"):
-        try:
-            with open(device + "idVendor") as handle:
-                if handle.read().strip() != "03e7":
-                    continue
-            with open(device + "speed") as handle:
-                return int(float(handle.read().strip()))
-        except (OSError, ValueError):
-            continue
-    return None
+# Depth costs frame rate, not bus speed. Measured on this OAK-D Lite: colour 20
+# fps plus aligned depth 10 fps ran for three minutes without a wobble on a USB
+# 2 link (chip plateaued near 50 C), while colour 30 plus mono 30 crashed the
+# device inside a minute even at SuperSpeed. So the rates below are the default
+# whenever depth is on, on any link, and --fps / --depth-fps override them.
+#
+# (An earlier version gated depth on a SuperSpeed link. That was wrong: it came
+# from depth failing under depthai v3, where the mono sensors never delivered a
+# frame on any bus, which looked like a bandwidth or power ceiling and was not.)
+DEPTH_COLOR_FPS = 20
+DEPTH_MONO_FPS = 10
 
 
 @dataclass
@@ -49,14 +40,12 @@ class Frame:
 
 class OakCamera:
     """
-    DepthAI v3 pipeline. v2 is not supported: its API has no `Camera.build`
-    and wires stereo differently, and requirements.txt pins depthai>=3.10.
+    Colour, and optionally aligned depth, from the OAK-D Lite.
 
-    Depth is requested but never assumed. On an underpowered USB 2.0 port the
-    OAK-D Lite browns out when the stereo pair spins up - it takes the whole
-    device down, colour stream included - so the pipeline is verified after
-    start and rebuilt without stereo if nothing arrives. aiRon then runs with
-    no range data rather than not running at all.
+    Speaks DepthAI v2 (ColorCamera + MonoCamera + XLinkOut + Device(pipeline))
+    and v3 (Camera.build + requestOutput + pipeline.start). v2 is preferred and
+    pinned, because it is the only one of the two that can drive this device's
+    stereo pair.
     """
 
     #: Colour frames that must arrive before a pipeline is considered alive.
@@ -64,85 +53,131 @@ class OakCamera:
     VERIFY_TIMEOUT_S = 6.0
 
     def __init__(self, width: int = 640, height: int = 480, fps: int = 30,
-                 want_depth: bool = True, force_depth: bool = False):
+                 want_depth: bool = True, force_depth: bool = False,
+                 depth_fps: int | None = None):
         import depthai as dai
 
-        if hasattr(dai.node, "XLinkOut"):
-            raise RuntimeError(
-                f"depthai {dai.__version__} is the v2 API; aiRon needs v3 "
-                "(pip install -U 'depthai>=3.10')"
-            )
-
         self.dai = dai
+        self.v3 = not hasattr(dai.node, "XLinkOut")
         self.width, self.height = width, height
-        self.fps = fps
         self.name = "OAK"
         self.usb_speed = "unknown"
 
-        self.link_mbps = usb_link_speed_mbps()
-        if want_depth and not force_depth and self.link_mbps and self.link_mbps < USB3_MBPS:
-            print(f"[vision] OAK is on a {self.link_mbps} Mbps USB 2 link. Its stereo pair "
-                  "browns the device out at that power budget, so depth stays off. Move it "
-                  "to a USB 3 port for range data, or pass --force-depth to try anyway.")
-            want_depth = False
+        want_depth = self._gate_depth(want_depth, force_depth)
+        # Running the stereo pair is what costs headroom, so back the colour
+        # sensor off too rather than letting the device fall over mid-session.
+        self.fps = min(fps, DEPTH_COLOR_FPS) if want_depth else fps
+        self.depth_fps = depth_fps or DEPTH_MONO_FPS
 
         self._build(want_depth)
         if want_depth and not self._verify():
             self.close()
             raise RuntimeError(
-                "the OAK accepted a stereo pipeline but streamed nothing - it has most "
-                "likely browned out. Re-run with --no-depth, or give it a USB 3 port."
+                "the OAK accepted a stereo pipeline but streamed no depth. "
+                "Re-run with --no-depth to continue without range data."
             )
+
+    def _gate_depth(self, want_depth: bool, force_depth: bool) -> bool:
+        """Refuse depth where it is known not to work. Link speed is checked later,
+        after boot, because it is not observable before it."""
+        if not want_depth:
+            return False
+        if self.v3 and not force_depth:
+            print(f"[vision] depthai {self.dai.__version__} cannot read this device's mono "
+                  "sensors, so depth is unavailable. Install 'depthai<3' for range data.")
+            return False
+        return True
 
     # ---------------------------------------------------------------- build
 
     def _build(self, want_depth: bool) -> None:
-        dai = self.dai
         self.has_depth = False
         self._depth_q = None
         self._last_depth = None
+        (self._build_v3 if self.v3 else self._build_v2)(want_depth)
+        self._read_device_info()
 
+    def _build_v2(self, want_depth: bool) -> None:
+        dai = self.dai
+        pipeline = dai.Pipeline()
+
+        cam = pipeline.create(dai.node.ColorCamera)
+        cam.setBoardSocket(dai.CameraBoardSocket.CAM_A)
+        cam.setPreviewSize(self.width, self.height)
+        cam.setInterleaved(False)
+        cam.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
+        cam.setFps(float(self.fps))
+        xout = pipeline.create(dai.node.XLinkOut)
+        xout.setStreamName("color")
+        cam.preview.link(xout.input)
+
+        if want_depth:
+            left = pipeline.create(dai.node.MonoCamera)
+            left.setBoardSocket(dai.CameraBoardSocket.CAM_B)
+            left.setResolution(dai.MonoCameraProperties.SensorResolution.THE_480_P)
+            left.setFps(float(self.depth_fps))
+            right = pipeline.create(dai.node.MonoCamera)
+            right.setBoardSocket(dai.CameraBoardSocket.CAM_C)
+            right.setResolution(dai.MonoCameraProperties.SensorResolution.THE_480_P)
+            right.setFps(float(self.depth_fps))
+
+            stereo = pipeline.create(dai.node.StereoDepth)
+            stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.DEFAULT)
+            stereo.initialConfig.setMedianFilter(dai.MedianFilter.KERNEL_7x7)
+            stereo.setLeftRightCheck(True)          # required for depth alignment
+            # Align onto the colour sensor AND match its resolution: aligned depth
+            # defaults to the full 1920x1080 sensor, ~4 MB a frame, which is a lot
+            # of USB for data we only ever median over a face box.
+            stereo.setDepthAlign(dai.CameraBoardSocket.CAM_A)
+            stereo.setOutputSize(self.width, self.height)
+            left.out.link(stereo.left)
+            right.out.link(stereo.right)
+            xdepth = pipeline.create(dai.node.XLinkOut)
+            xdepth.setStreamName("depth")
+            stereo.depth.link(xdepth.input)
+            self.has_depth = True
+
+        self.device = dai.Device(pipeline)
+        self._color_q = self.device.getOutputQueue("color", maxSize=4, blocking=False)
+        if want_depth:
+            self._depth_q = self.device.getOutputQueue("depth", maxSize=4, blocking=False)
+
+    def _build_v3(self, want_depth: bool) -> None:
+        dai = self.dai
         self.pipeline = dai.Pipeline()
         cam = self.pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
         color_out = cam.requestOutput((self.width, self.height),
                                       dai.ImgFrame.Type.BGR888i, fps=float(self.fps))
         self._color_q = color_out.createOutputQueue(maxSize=4, blocking=False)
 
-        if want_depth:
-            try:
-                stereo = self.pipeline.create(dai.node.StereoDepth).build(
-                    autoCreateCameras=True,
-                    presetMode=dai.node.StereoDepth.PresetMode.FACE,
-                    size=(640, 400),
-                    fps=float(min(self.fps, 15)),
-                )
-                stereo.setDepthAlign(dai.CameraBoardSocket.CAM_A)
-                self._depth_q = stereo.depth.createOutputQueue(maxSize=4, blocking=False)
-                self.has_depth = True
-            except Exception as exc:
-                print(f"[vision] stereo unavailable: {exc}")
-
+        if want_depth:   # only reachable via --force-depth; known not to stream
+            stereo = self.pipeline.create(dai.node.StereoDepth).build(
+                autoCreateCameras=True,
+                presetMode=dai.node.StereoDepth.PresetMode.FACE,
+                size=(self.width, self.height),
+                fps=float(self.depth_fps),
+            )
+            stereo.setDepthAlign(dai.CameraBoardSocket.CAM_A)
+            self._depth_q = stereo.depth.createOutputQueue(maxSize=4, blocking=False)
+            self.has_depth = True
         self.pipeline.start()
-        self._read_device_info()
 
     def _read_device_info(self) -> None:
+        device = self.pipeline.getDefaultDevice() if self.v3 else self.device
         try:
-            device = self.pipeline.getDefaultDevice()
             self.name = device.getDeviceName()
+        except Exception:
+            pass
+        try:
             self.usb_speed = str(device.getUsbSpeed()).split(".")[-1]
         except Exception:
             pass
-        if self.usb_speed not in ("SUPER", "SUPER_PLUS", "unknown"):
-            print(f"[vision] link is USB {self.usb_speed} - fine for colour, "
-                  "not enough for the stereo pair")
 
     def _verify(self) -> bool:
-        """Confirm the device actually streams; a crashed OAK accepts config silently."""
-        import time as _t
-
+        """Confirm the device actually streams; a starved pipeline configures silently."""
         color_seen = depth_seen = 0
-        deadline = _t.monotonic() + self.VERIFY_TIMEOUT_S
-        while _t.monotonic() < deadline:
+        deadline = time.monotonic() + self.VERIFY_TIMEOUT_S
+        while time.monotonic() < deadline:
             try:
                 if self._color_q.tryGet() is not None:
                     color_seen += 1
@@ -152,7 +187,7 @@ class OakCamera:
                 return False
             if color_seen >= self.VERIFY_COLOR_FRAMES and depth_seen >= 1:
                 return True
-            _t.sleep(0.005)
+            time.sleep(0.005)
         return False
 
     # ----------------------------------------------------------------- read
@@ -177,7 +212,7 @@ class OakCamera:
 
     def close(self) -> None:
         try:
-            self.pipeline.stop()
+            self.pipeline.stop() if self.v3 else self.device.close()
         except Exception:
             pass
 

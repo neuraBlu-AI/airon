@@ -26,6 +26,13 @@ class EventType(str, Enum):
     OBJECT_DETECTED = "OBJECT_DETECTED"
     GESTURE_DETECTED = "GESTURE_DETECTED"
 
+    # Not in the spec's list, but aiRon has to know when it has gone blind.
+    # The OAK can reset itself out from under a running pipeline, and a face
+    # that keeps blinking cheerfully at a dead camera is a worse failure than
+    # one that visibly goes to sleep.
+    CAMERA_LOST = "CAMERA_LOST"
+    CAMERA_READY = "CAMERA_READY"
+
 
 @dataclass
 class Event:
