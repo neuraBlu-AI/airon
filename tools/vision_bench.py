@@ -28,8 +28,10 @@ def main() -> int:
     store, bus = StateStore(), EventBus()
     bus.subscribe(lambda e: print(f"[event] {e}"))
 
-    vision = VisionService(store, bus, want_depth="--no-depth" not in sys.argv)
-    print(f"[bench] {vision.camera.name}, depth={vision.camera.has_depth}")
+    vision = VisionService(store, bus, want_depth="--no-depth" not in sys.argv,
+                           stream_depth=True)
+    print(f"[bench] {vision.camera.name}, depth={vision.camera.has_depth}, "
+          f"on-device detector={vision.camera.has_detector}")
     vision.start()
 
     debug = True
@@ -45,9 +47,19 @@ def main() -> int:
             view = frame.color.copy()
             person = store.get().primary
 
+            # Boxes the camera's own tracker reports, with their persistent ids.
+            for t in frame.tracks:
+                x, y, w, h = t.bbox
+                live = t.status in ("NEW", "TRACKED")
+                cv2.rectangle(view, (x, y), (x + w, y + h),
+                              (90, 220, 120) if live else (90, 140, 200), 2)
+                label = f"#{t.id} {t.status}"
+                if t.distance_m:
+                    label += f" {t.distance_m:.2f}m"
+                cv2.putText(view, label, (x, max(y - 8, 12)), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5, (90, 220, 120), 1, cv2.LINE_AA)
+
             if debug and obs.found:
-                x, y, w, h = obs.bbox
-                cv2.rectangle(view, (x, y), (x + w, y + h), (90, 220, 120), 2)
                 for ex, ey, ew, eh in obs.debug.get("eyes", []):
                     cv2.rectangle(view, (ex, ey), (ex + ew, ey + eh), (230, 200, 90), 1)
                 curve = obs.debug.get("mouth_curve")

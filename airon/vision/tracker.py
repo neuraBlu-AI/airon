@@ -1,10 +1,14 @@
 """
-Face measurement on the Jetson CPU.
+Expression measurement on the Jetson CPU.
 
-Everything here comes from OpenCV Haar cascades, which ship inside
-opencv-python: no model download, no network, no MyriadX time. That keeps the
-camera's NN cores free for the face-recognition and person-detection work of
-spec section 12, which is where they actually earn their keep.
+Finding the face is the camera's job now - a MobileNet-SSD detector and an
+ObjectTracker run on the MyriadX and hand over a box with a stable id. This
+module reads what the face inside that box is doing: eyes open or shut, and the
+curve and opening of the mouth. Haar cascades are still used for the eyes,
+which is cheap and confined to a known face region.
+
+If no detector blob is installed, update() falls back to finding the face here
+too, so aiRon still works - just less robustly to head pose.
 
 This module only measures. It does not decide what an expression means.
 """
@@ -79,28 +83,41 @@ class FaceTracker:
         self._calibrating = 0
         self.curv_base = self.curv
 
-    def update(self, frame: np.ndarray, dt: float) -> FaceObservation:
+    def update(self, frame: np.ndarray, dt: float,
+               bbox: tuple[int, int, int, int] | None = None) -> FaceObservation:
+        """
+        Measure the face in `bbox` (full-resolution pixels, from the camera's
+        own tracker). With no bbox, fall back to detecting one here.
+        """
         h, w = frame.shape[:2]
         scale = self.DETECT_W / float(w)
         small = cv2.resize(frame, (self.DETECT_W, int(h * scale)))
         grey = cv2.equalizeHist(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY))
         grey_full = cv2.equalizeHist(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
 
-        faces = self.face_cc.detectMultiScale(grey, 1.15, 5, minSize=(48, 48))
         obs = self.obs
         obs.debug = {}
 
-        if not len(faces):
-            obs.found = False
-            obs.eyes_open = approach(obs.eyes_open, 1.0, 10.0, dt)
-            obs.mouth_curve = approach(obs.mouth_curve, 0.0, 6.0, dt)
-            obs.mouth_open = approach(obs.mouth_open, 0.0, 6.0, dt)
-            return obs
+        if bbox is None:
+            faces = self.face_cc.detectMultiScale(grey, 1.15, 5, minSize=(48, 48))
+            if not len(faces):
+                obs.found = False
+                obs.eyes_open = approach(obs.eyes_open, 1.0, 10.0, dt)
+                obs.mouth_curve = approach(obs.mouth_curve, 0.0, 6.0, dt)
+                obs.mouth_open = approach(obs.mouth_open, 0.0, 6.0, dt)
+                return obs
+            # Biggest face wins - whoever is closest is who aiRon is talking to.
+            box_small = max(faces, key=lambda f: f[2] * f[3])
+            obs.bbox = tuple((np.array(box_small) / scale).astype(int))
+        else:
+            obs.bbox = tuple(int(v) for v in bbox)
+            box_small = (np.array(bbox) * scale).astype(int)
 
-        # Biggest face wins - whoever is closest is who aiRon is talking to.
-        fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
+        fx, fy, fw, fh = (int(v) for v in box_small)
+        fx, fy = max(fx, 0), max(fy, 0)
+        fw = max(min(fw, grey.shape[1] - fx), 1)
+        fh = max(min(fh, grey.shape[0] - fy), 1)
         obs.found = True
-        obs.bbox = tuple((np.array([fx, fy, fw, fh]) / scale).astype(int))
         obs.debug["face"] = obs.bbox
 
         gx = (fx + fw / 2.0) / grey.shape[1]

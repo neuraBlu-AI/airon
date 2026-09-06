@@ -61,6 +61,8 @@ def parse_args(argv=None):
                         help="default voice language")
     parser.add_argument("--name", default=None,
                         help="greet by this name, until face recognition lands")
+    parser.add_argument("--speech-rate", type=float, default=1.05,
+                        help="Piper length_scale: 1.0 natural pace, higher is slower")
     parser.add_argument("--no-voice", action="store_true",
                         help="run silently, without speech_service")
     parser.add_argument("--debug", action="store_true",
@@ -90,7 +92,8 @@ def main(argv=None) -> int:
 
     speech = None
     if not args.no_voice:
-        speech = SpeechService(bus, default_lang=args.lang)
+        speech = SpeechService(bus, default_lang=args.lang,
+                               length_scale=args.speech_rate)
         if speech.available():
             speech.start()
             print(f"[aiRon] voice ready: {', '.join(speech.available())}")

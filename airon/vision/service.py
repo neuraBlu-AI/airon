@@ -9,7 +9,6 @@ yet, so everyone gets a temporary id (spec section 12).
 
 from __future__ import annotations
 
-import itertools
 import threading
 import time
 
@@ -17,12 +16,15 @@ from ..core import EventBus, EventType, Person, StateStore, WorldState
 from .camera import OakCamera, sample_distance
 from .tracker import FaceTracker
 
-# How long a face may be missing before aiRon accepts that you have gone.
-# Haar cascades only see faces looking roughly at the camera, so glancing away,
-# tilting your head or leaning out of frame all read as a dropped detection. At
-# 1.2 s that produced eleven "arrivals" in two minutes of one person sitting
-# still. Leaving a room genuinely takes longer than looking away does.
-PRESENCE_GRACE_S = 4.0
+# How long a face may be missing before aiRon accepts that you have gone. The
+# camera's ObjectTracker now bridges detection gaps itself and reports LOST
+# before REMOVED, so this no longer has to paper over a fragile detector.
+PRESENCE_GRACE_S = 2.5
+
+#: Track states that still count as "this person is here".
+PRESENT = ("NEW", "TRACKED", "LOST")
+#: States good enough to measure an expression from.
+MEASURABLE = ("NEW", "TRACKED")
 
 # Eye contact needs hysteresis or a blink reads as looking away: enter the state
 # only once it has held, and leave it only after a sustained absence.
@@ -40,14 +42,15 @@ class VisionService:
     def __init__(self, store: StateStore, bus: EventBus, *,
                  width: int = 640, height: int = 480, fps: int = 30,
                  want_depth: bool = True, force_depth: bool = False,
-                 depth_fps: int | None = None):
+                 depth_fps: int | None = None, stream_depth: bool = False):
         self.store = store
         self.bus = bus
         self.camera = OakCamera(width, height, fps, want_depth=want_depth,
-                                force_depth=force_depth, depth_fps=depth_fps)
+                                force_depth=force_depth, depth_fps=depth_fps,
+                                stream_depth=stream_depth)
         self.tracker = FaceTracker()
 
-        self._ids = itertools.count(1)
+        self._track_id: int | None = None
         self._person: Person | None = None
         self._last_seen = 0.0
         self._was_looking = False
@@ -57,9 +60,10 @@ class VisionService:
         self._thread = threading.Thread(target=self._run, name="vision", daemon=True)
         self._stop = threading.Event()
         self.camera_ok = True
+        self._dt = 1 / 30
         self._camera_args = dict(width=width, height=height, fps=fps,
                                  want_depth=want_depth, force_depth=force_depth,
-                                 depth_fps=depth_fps)
+                                 depth_fps=depth_fps, stream_depth=stream_depth)
 
         # Latest frame kept for tools/vision_bench.py. The face never reads it.
         self._lock = threading.Lock()
@@ -103,7 +107,8 @@ class VisionService:
             last = now
             self.fps = self.fps * 0.9 + (0.1 / dt) if dt > 0 else self.fps
 
-            obs = self.tracker.update(frame.color, dt)
+            self._dt = dt
+            obs = self.tracker.update(frame.color, dt) if not self.camera.has_detector else self.tracker.obs
             self._update_world(obs, frame, now)
 
             with self._lock:
@@ -141,50 +146,78 @@ class VisionService:
         self.bus.publish(EventType.CAMERA_READY, depth=self.camera.has_depth)
 
     def _update_world(self, obs, frame, now: float) -> None:
-        if obs.found:
-            self._last_seen = now
-            if self._person is None:
-                self._person = Person(id=f"person_{next(self._ids):03d}")
-                self.bus.publish(EventType.PERSON_ENTERED, person=self._person.id)
-                self.bus.publish(EventType.UNKNOWN_PERSON_DETECTED, person=self._person.id)
-
-            p = self._person
-            p.bbox = obs.bbox
-            p.attention_x = obs.attention_x
-            p.attention_y = obs.attention_y
-            p.head_roll = obs.head_roll
-            p.eyes_open = obs.eyes_open
-            p.mouth_curve = obs.mouth_curve
-            p.mouth_open = obs.mouth_open
-            p.last_seen = time.time()
-            p.distance_m = sample_distance(frame.depth, obs.bbox, frame.color.shape)
-            p.position = ("left" if obs.attention_x < -0.25
-                          else "right" if obs.attention_x > 0.25 else "center")
-
-            # Frontal enough that both eyes are visible, and roughly centred:
-            # a rough proxy until real gaze estimation lands.
-            raw_looking = obs.eyes_open > 0.5 and abs(obs.attention_x) < 0.6
-            if raw_looking:
-                self._look_true_at = self._look_true_at or now
-                self._look_false_at = None
-            else:
-                self._look_false_at = self._look_false_at or now
-                self._look_true_at = None
-
-            if (not self._was_looking and self._look_true_at
-                    and now - self._look_true_at >= LOOK_ENTER_S):
-                self._was_looking = True
-                self.bus.publish(EventType.PERSON_LOOKING_AT_AIRON, person=p.id)
-            elif (self._was_looking and self._look_false_at
-                    and now - self._look_false_at >= LOOK_EXIT_S):
-                self._was_looking = False
-            p.looking_at_airon = self._was_looking
-
+        present = [t for t in frame.tracks if t.status in PRESENT]
+        if present or not self.camera.has_detector:
+            self._update_person(obs, frame, now, present)
         elif self._person is not None and now - self._last_seen > PRESENCE_GRACE_S:
             self.bus.publish(EventType.PERSON_LEFT, person=self._person.id)
             self._person = None
+            self._track_id = None
             self._was_looking = False
             self._look_true_at = self._look_false_at = None
 
         people = [self._person] if self._person is not None else []
         self.store.set(WorldState(people=people, timestamp=time.time()))
+
+    def _update_person(self, obs, frame, now: float, present: list) -> None:
+        track = None
+        if present:
+            # Whoever is nearest has aiRon's attention; without depth, whoever
+            # fills most of the frame.
+            ranged = [t for t in present if t.distance_m]
+            track = (min(ranged, key=lambda t: t.distance_m) if ranged
+                     else max(present, key=lambda t: t.bbox[2] * t.bbox[3]))
+
+        measurable = track is not None and track.status in MEASURABLE
+        obs = self.tracker.update(frame.color, self._dt,
+                                  bbox=track.bbox if measurable else None) \
+            if (track is not None or not self.camera.has_detector) else obs
+        if not obs.found and track is None:
+            if self._person is not None and now - self._last_seen > PRESENCE_GRACE_S:
+                self.bus.publish(EventType.PERSON_LEFT, person=self._person.id)
+                self._person = None
+                self._track_id = None
+            return
+
+        self._last_seen = now
+        # The id comes from the camera's tracker, so it survives head turns and
+        # brief occlusion - which is what stops aiRon greeting you every 20 s.
+        track_id = track.id if track is not None else 0
+        if self._person is None or self._track_id != track_id:
+            if self._person is not None:
+                self.bus.publish(EventType.PERSON_LEFT, person=self._person.id)
+            self._person = Person(id=f"person_{track_id:03d}")
+            self._track_id = track_id
+            self.bus.publish(EventType.PERSON_ENTERED, person=self._person.id)
+            self.bus.publish(EventType.UNKNOWN_PERSON_DETECTED, person=self._person.id)
+
+        p = self._person
+        p.bbox = obs.bbox
+        p.attention_x = obs.attention_x
+        p.attention_y = obs.attention_y
+        p.head_roll = obs.head_roll
+        p.eyes_open = obs.eyes_open
+        p.mouth_curve = obs.mouth_curve
+        p.mouth_open = obs.mouth_open
+        p.last_seen = time.time()
+        p.distance_m = (track.distance_m if track is not None and track.distance_m
+                        else sample_distance(frame.depth, obs.bbox, frame.color.shape))
+        p.position = ("left" if obs.attention_x < -0.25
+                      else "right" if obs.attention_x > 0.25 else "center")
+
+        raw_looking = obs.eyes_open > 0.5 and abs(obs.attention_x) < 0.6
+        if raw_looking:
+            self._look_true_at = self._look_true_at or now
+            self._look_false_at = None
+        else:
+            self._look_false_at = self._look_false_at or now
+            self._look_true_at = None
+
+        if (not self._was_looking and self._look_true_at
+                and now - self._look_true_at >= LOOK_ENTER_S):
+            self._was_looking = True
+            self.bus.publish(EventType.PERSON_LOOKING_AT_AIRON, person=p.id)
+        elif (self._was_looking and self._look_false_at
+                and now - self._look_false_at >= LOOK_EXIT_S):
+            self._was_looking = False
+        p.looking_at_airon = self._was_looking

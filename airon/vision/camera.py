@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 
@@ -31,10 +32,39 @@ DEPTH_COLOR_FPS = 20
 DEPTH_MONO_FPS = 10
 
 
+#: Face detector run on the camera's own NN cores. MobileNet-SSD based, 300x300
+#: input, one class. Far more tolerant of head pose than a Haar cascade, and it
+#: costs the Jetson nothing - the MyriadX was otherwise idle.
+MODEL_DIR = Path(__file__).resolve().parent.parent.parent / "models"
+SHAVES = 6
+FACE_BLOB = f"face-detection-retail-0004_openvino_2022.1_{SHAVES}shave.blob"
+FACE_LABEL = 1
+
+#: Detections below this confidence never become tracklets.
+CONFIDENCE = 0.5
+
+#: Spatial coordinates are the median depth inside a shrunken detection box;
+#: half the box avoids sampling the background around a head.
+BOX_SCALE = 0.5
+DEPTH_MIN_MM, DEPTH_MAX_MM = 200, 7000
+
+
+@dataclass
+class Track:
+    """One tracked face, as the camera itself reports it."""
+
+    id: int                      # persistent across frames, assigned on device
+    status: str                  # NEW | TRACKED | LOST | REMOVED
+    bbox: tuple[int, int, int, int]          # in colour-frame pixels
+    distance_m: float | None = None          # from spatial coordinates
+    spatial_mm: tuple[float, float, float] | None = None
+
+
 @dataclass
 class Frame:
     color: np.ndarray
     depth: np.ndarray | None = None          # uint16, millimetres, aligned to colour
+    tracks: list = field(default_factory=list)
     timestamp: float = field(default_factory=time.monotonic)
 
 
@@ -54,7 +84,7 @@ class OakCamera:
 
     def __init__(self, width: int = 640, height: int = 480, fps: int = 30,
                  want_depth: bool = True, force_depth: bool = False,
-                 depth_fps: int | None = None):
+                 depth_fps: int | None = None, stream_depth: bool = False):
         import depthai as dai
 
         self.dai = dai
@@ -62,6 +92,9 @@ class OakCamera:
         self.width, self.height = width, height
         self.name = "OAK"
         self.usb_speed = "unknown"
+        self.stream_depth = stream_depth
+        self.has_detector = False
+        self._track_q = None
 
         want_depth = self._gate_depth(want_depth, force_depth)
         # Running the stereo pair is what costs headroom, so back the colour
@@ -73,8 +106,8 @@ class OakCamera:
         if want_depth and not self._verify():
             self.close()
             raise RuntimeError(
-                "the OAK accepted a stereo pipeline but streamed no depth. "
-                "Re-run with --no-depth to continue without range data."
+                "the OAK accepted the pipeline but streamed nothing. Re-run with "
+                "--no-depth to drop stereo, which is the usual culprit."
             )
 
     def _gate_depth(self, want_depth: bool, force_depth: bool) -> bool:
@@ -98,6 +131,14 @@ class OakCamera:
         self._read_device_info()
 
     def _build_v2(self, want_depth: bool) -> None:
+        """
+        Everything the camera can do for itself, it does.
+
+        Face detection and tracking run on the MyriadX, and with depth wired in
+        the detector reports spatial coordinates directly - so aiRon gets a
+        distance per face without the depth map ever crossing USB. The Jetson
+        receives a colour frame and a short list of tracklets.
+        """
         dai = self.dai
         pipeline = dai.Pipeline()
 
@@ -111,6 +152,13 @@ class OakCamera:
         xout.setStreamName("color")
         cam.preview.link(xout.input)
 
+        blob = MODEL_DIR / FACE_BLOB
+        self.has_detector = blob.exists()
+        if not self.has_detector:
+            print(f"[vision] {FACE_BLOB} missing - run tools/fetch_models.py. "
+                  "Falling back to Haar face detection on the CPU.")
+
+        stereo = None
         if want_depth:
             left = pipeline.create(dai.node.MonoCamera)
             left.setBoardSocket(dai.CameraBoardSocket.CAM_B)
@@ -124,23 +172,68 @@ class OakCamera:
             stereo = pipeline.create(dai.node.StereoDepth)
             stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.DEFAULT)
             stereo.initialConfig.setMedianFilter(dai.MedianFilter.KERNEL_7x7)
-            stereo.setLeftRightCheck(True)          # required for depth alignment
-            # Align onto the colour sensor AND match its resolution: aligned depth
-            # defaults to the full 1920x1080 sensor, ~4 MB a frame, which is a lot
-            # of USB for data we only ever median over a face box.
+            stereo.setLeftRightCheck(True)
             stereo.setDepthAlign(dai.CameraBoardSocket.CAM_A)
             stereo.setOutputSize(self.width, self.height)
             left.out.link(stereo.left)
             right.out.link(stereo.right)
-            xdepth = pipeline.create(dai.node.XLinkOut)
-            xdepth.setStreamName("depth")
-            stereo.depth.link(xdepth.input)
             self.has_depth = True
+
+            # The depth map itself is only needed for the tuning bench. With the
+            # detector on board, distance arrives inside the tracklets instead,
+            # which is a few hundred bytes a frame rather than a few hundred KB.
+            if self.stream_depth:
+                xdepth = pipeline.create(dai.node.XLinkOut)
+                xdepth.setStreamName("depth")
+                stereo.depth.link(xdepth.input)
+
+        if self.has_detector:
+            manip = pipeline.create(dai.node.ImageManip)
+            manip.initialConfig.setResize(300, 300)
+            manip.initialConfig.setFrameType(dai.ImgFrame.Type.BGR888p)
+            manip.setMaxOutputFrameSize(300 * 300 * 3)
+            cam.preview.link(manip.inputImage)
+
+            if stereo is not None:
+                detector = pipeline.create(dai.node.MobileNetSpatialDetectionNetwork)
+                detector.setBoundingBoxScaleFactor(BOX_SCALE)
+                detector.setDepthLowerThreshold(DEPTH_MIN_MM)
+                detector.setDepthUpperThreshold(DEPTH_MAX_MM)
+                stereo.depth.link(detector.inputDepth)
+            else:
+                detector = pipeline.create(dai.node.MobileNetDetectionNetwork)
+            detector.setBlobPath(str(blob))
+            detector.setConfidenceThreshold(CONFIDENCE)
+            detector.input.setBlocking(False)
+            manip.out.link(detector.input)
+
+            tracker = pipeline.create(dai.node.ObjectTracker)
+            tracker.setDetectionLabelsToTrack([FACE_LABEL])
+            # SHORT_TERM_IMAGELESS predicts a track forward through frames where
+            # detection blinks out, which ZERO_TERM types cannot - "zero term"
+            # means no temporal reasoning at all. Measured over 35 s with a face
+            # in view: IMAGELESS 696 packets and a single acquisition, colour
+            # histogram 695 packets but two, KCF only 149 packets - it holds the
+            # track but collapses the frame rate on this device.
+            tracker.setTrackerType(dai.TrackerType.SHORT_TERM_IMAGELESS)
+            # UNIQUE_ID over SMALLEST_ID: a recycled id would silently make a
+            # new person look like the previous one, which matters the moment
+            # face recognition starts attaching names to these tracks.
+            tracker.setTrackerIdAssignmentPolicy(dai.TrackerIdAssignmentPolicy.UNIQUE_ID)
+            detector.passthrough.link(tracker.inputTrackerFrame)
+            detector.passthrough.link(tracker.inputDetectionFrame)
+            detector.out.link(tracker.inputDetections)
+
+            xtracks = pipeline.create(dai.node.XLinkOut)
+            xtracks.setStreamName("tracklets")
+            tracker.out.link(xtracks.input)
 
         self.device = dai.Device(pipeline)
         self._color_q = self.device.getOutputQueue("color", maxSize=4, blocking=False)
-        if want_depth:
+        if want_depth and self.stream_depth:
             self._depth_q = self.device.getOutputQueue("depth", maxSize=4, blocking=False)
+        if self.has_detector:
+            self._track_q = self.device.getOutputQueue("tracklets", maxSize=4, blocking=False)
 
     def _build_v3(self, want_depth: bool) -> None:
         dai = self.dai
@@ -174,18 +267,32 @@ class OakCamera:
             pass
 
     def _verify(self) -> bool:
-        """Confirm the device actually streams; a starved pipeline configures silently."""
-        color_seen = depth_seen = 0
+        """
+        Confirm the device actually streams; a starved pipeline configures
+        silently and reports nothing wrong.
+
+        Only wait for streams that are actually expected. With the detector on
+        board the depth map stays on the camera - distance arrives inside the
+        tracklets - so there is no depth queue to see frames on.
+        """
+        want_depth_frames = self._depth_q is not None
+        want_tracks = self._track_q is not None
+        color_seen = depth_seen = track_seen = 0
+
         deadline = time.monotonic() + self.VERIFY_TIMEOUT_S
         while time.monotonic() < deadline:
             try:
                 if self._color_q.tryGet() is not None:
                     color_seen += 1
-                if self._depth_q is not None and self._depth_q.tryGet() is not None:
+                if want_depth_frames and self._depth_q.tryGet() is not None:
                     depth_seen += 1
+                if want_tracks and self._track_q.tryGet() is not None:
+                    track_seen += 1
             except Exception:
                 return False
-            if color_seen >= self.VERIFY_COLOR_FRAMES and depth_seen >= 1:
+            if (color_seen >= self.VERIFY_COLOR_FRAMES
+                    and (depth_seen >= 1 or not want_depth_frames)
+                    and (track_seen >= 1 or not want_tracks)):
                 return True
             time.sleep(0.005)
         return False
@@ -193,7 +300,7 @@ class OakCamera:
     # ----------------------------------------------------------------- read
 
     def read(self) -> Frame | None:
-        """Newest colour frame, with the newest depth alongside it. Non-blocking."""
+        """Newest colour frame, plus whatever the camera has tracked. Non-blocking."""
         try:
             packet = self._color_q.tryGet()
         except Exception:
@@ -208,7 +315,37 @@ class OakCamera:
                     self._last_depth = depth_packet.getFrame()
             except Exception:
                 pass
-        return Frame(color=packet.getCvFrame(), depth=self._last_depth)
+
+        if self._track_q is not None:
+            try:
+                tracklets = self._track_q.tryGet()
+                if tracklets is not None:
+                    self._last_tracks = self._decode(tracklets)
+            except Exception:
+                pass
+
+        return Frame(color=packet.getCvFrame(), depth=self._last_depth,
+                     tracks=getattr(self, "_last_tracks", []))
+
+    def _decode(self, packet) -> list:
+        """Tracklet ROIs are normalised; turn them into colour-frame pixels."""
+        tracks = []
+        for t in packet.tracklets:
+            roi = t.roi.denormalize(self.width, self.height)
+            spatial = None
+            distance = None
+            coords = getattr(t, "spatialCoordinates", None)
+            if coords is not None and coords.z > 0:
+                spatial = (coords.x, coords.y, coords.z)
+                distance = coords.z / 1000.0
+            tracks.append(Track(
+                id=int(t.id),
+                status=str(t.status).rsplit(".", 1)[-1],
+                bbox=(int(roi.x), int(roi.y), int(roi.width), int(roi.height)),
+                distance_m=distance,
+                spatial_mm=spatial,
+            ))
+        return tracks
 
     def close(self) -> None:
         try:

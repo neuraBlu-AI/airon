@@ -13,10 +13,11 @@ that animation stay independent of everything slow.
 
 from __future__ import annotations
 
-import io
+import os
 import queue
 import re
 import subprocess
+import tempfile
 import threading
 import time
 import wave
@@ -74,11 +75,15 @@ class Utterance:
 
 class SpeechService:
     def __init__(self, bus: EventBus, default_lang: str = "en",
-                 voice_dir: Path | None = None, volume: float = 0.9):
+                 voice_dir: Path | None = None, volume: float = 0.9,
+                 length_scale: float = 1.0):
         self.bus = bus
         self.default_lang = default_lang
         self.voice_dir = voice_dir or VOICE_DIR
         self.volume = volume
+        #: Piper's length_scale: 1.0 is the voice's natural pace, higher is
+        #: slower. Worth nudging up slightly - aiRon should sound unhurried.
+        self.length_scale = length_scale
 
         self._voices: dict[str, object] = {}
         self._queue: queue.Queue[Utterance | None] = queue.Queue()
@@ -149,58 +154,56 @@ class SpeechService:
                     self._speaking, self._level = False, 0.0
 
     def _speak(self, utterance: Utterance) -> None:
+        from piper.config import SynthesisConfig
+
         lang = utterance.lang if utterance.lang in VOICES else self.default_lang
         voice = self._voice(lang)
 
-        chunks = [c.audio_int16_array for c in voice.synthesize(utterance.text)]
+        config = SynthesisConfig(length_scale=self.length_scale)
+        chunks = [c.audio_int16_array for c in voice.synthesize(utterance.text, config)]
         if not chunks:
             return
         audio = np.concatenate(chunks)
         rate = voice.config.sample_rate
         envelope = self._envelope(audio)
 
-        self.bus.publish(EventType.SPEECH_STARTED, text=utterance.text, lang=lang)
-        with self._lock:
-            self._speaking = True
-
-        proc = subprocess.Popen(
-            ["pw-play", "--volume", str(self.volume), "-"],
-            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-        # pw-play in this build cannot read raw PCM, so hand it a WAV stream.
-        # Writing happens on its own thread: a big utterance would otherwise
-        # block on the pipe buffer and freeze the mouth mid-sentence.
-        buffer = io.BytesIO()
-        with wave.open(buffer, "wb") as wav:
-            wav.setnchannels(1)
-            wav.setsampwidth(2)
-            wav.setframerate(rate)
-            wav.writeframes(audio.tobytes())
-        writer = threading.Thread(
-            target=self._feed, args=(proc, buffer.getvalue()), daemon=True)
-        writer.start()
-
-        started = time.monotonic()
-        seconds_per_frame = ENVELOPE_FRAME / rate
-        while proc.poll() is None and not self._stop.is_set():
-            elapsed = time.monotonic() - started - PLAYBACK_LATENCY_S
-            index = int(elapsed / seconds_per_frame)
-            with self._lock:
-                self._level = float(envelope[index]) if 0 <= index < len(envelope) else 0.0
-            time.sleep(0.008)
-
-        writer.join(timeout=1.0)
-        with self._lock:
-            self._speaking, self._level = False, 0.0
-        self.bus.publish(EventType.SPEECH_FINISHED, text=utterance.text)
-
-    @staticmethod
-    def _feed(proc, payload: bytes) -> None:
+        # Hand pw-play a real file, never a pipe. sndfile cannot seek a pipe, so
+        # it never reads the WAV header and falls back to 48 kHz stereo, playing
+        # this 22.05 kHz mono audio about three times too fast - it sounds like a
+        # tape on fast-forward. Measured: 1.78 s of speech played in 0.56 s.
+        handle, path = tempfile.mkstemp(suffix=".wav", prefix="airon-say-")
+        os.close(handle)
         try:
-            proc.stdin.write(payload)
-            proc.stdin.close()
-        except (BrokenPipeError, ValueError):
-            pass
+            with wave.open(path, "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(rate)
+                wav.writeframes(audio.tobytes())
+
+            self.bus.publish(EventType.SPEECH_STARTED, text=utterance.text, lang=lang)
+            with self._lock:
+                self._speaking = True
+
+            proc = subprocess.Popen(
+                ["pw-play", "--volume", str(self.volume), path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            started = time.monotonic()
+            seconds_per_frame = ENVELOPE_FRAME / rate
+            while proc.poll() is None and not self._stop.is_set():
+                elapsed = time.monotonic() - started - PLAYBACK_LATENCY_S
+                index = int(elapsed / seconds_per_frame)
+                with self._lock:
+                    self._level = float(envelope[index]) if 0 <= index < len(envelope) else 0.0
+                time.sleep(0.008)
+        finally:
+            with self._lock:
+                self._speaking, self._level = False, 0.0
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        self.bus.publish(EventType.SPEECH_FINISHED, text=utterance.text)
 
     @staticmethod
     def _envelope(audio: np.ndarray) -> np.ndarray:
