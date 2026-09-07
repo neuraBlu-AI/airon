@@ -1028,3 +1028,35 @@ Rules:
 
 Work that is not a ticket - a fix to this document, tooling configuration -
 does not need a ticket branch, but still does not go straight to `main`.
+
+## Who Merges
+
+Pull requests are opened by whoever did the work. They are reviewed and merged
+by the repository owner, and by nobody else.
+
+This is not a formality. Every merge so far has been onto a robot that has to
+be stood in front of to be judged: whether a reply arrives quickly enough to
+feel like conversation, whether a pause is aiRon thinking or aiRon broken,
+whether it greeted the right person. None of that is visible in a diff, and
+a green test run is not a substitute for having watched the thing run.
+
+Rules:
+
+- Claude opens pull requests. Claude does not merge them, and does not merge
+  its own work to `main` under any circumstances.
+- A pull request is where work is handed over, not where it is finished.
+  Say what was measured, what was not verified, and what the reviewer should
+  look at while the robot is in front of them.
+- Anything found while working that was not asked for goes in the pull request
+  description or a new ticket - not quietly into the branch.
+- If a merge really is wanted immediately, the owner says so in that instance.
+  It does not become the habit afterwards.
+- Deleting branches, retargeting a pull request, and closing tickets are part
+  of the handover and can be done as asked - it is the merge to `main` that
+  is reserved.
+
+The one thing worth checking on every pull request, because it has gone wrong
+twice: **the base branch**. A pull request stacked on another branch does not
+always get retargeted to `main` when that branch merges, and merging it then
+puts the work somewhere that is not `main` without complaining. #2 landed on
+`phase1/vision-face-services` this way and had to be redone as #4.
