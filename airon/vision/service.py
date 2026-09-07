@@ -56,7 +56,12 @@ IDENTITY_AGREE = 3
 # walking in while looking away can take a couple of seconds to present a face
 # the gate will accept, and announcing a stranger before then is just wrong.
 # Sampling continues afterwards: turn around and aiRon still catches up.
-IDENTITY_TIMEOUT_S = 4.0
+#
+# Six seconds, not four. Measured against a person enrolled from eight views:
+# recognition settled 5 to 6 s after the track appeared, because most samples
+# were rejected as clipped while they moved. Four seconds meant aiRon asked a
+# person it knew what their name was, and worked it out while they answered.
+IDENTITY_TIMEOUT_S = 6.0
 
 # Views of the current person, kept in case they introduce themselves. By the
 # time somebody has finished saying "my name is Pierre", aiRon has been

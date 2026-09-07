@@ -153,6 +153,7 @@ class BrainService:
     def _on_event(self, event) -> None:
         kind = event.type
         if kind is EventType.KNOWN_PERSON_DETECTED:
+            self._recognised_mid_question(event.payload.get("was"))
             self._greet(event.payload.get("person"), event.payload.get("name"),
                         was=event.payload.get("was"))
         elif kind is EventType.UNKNOWN_PERSON_DETECTED:
@@ -245,6 +246,23 @@ class BrainService:
         self._look("happy")
         self._say("named", name=identity.name)
         self._end_conversation()
+
+    def _recognised_mid_question(self, was: str | None) -> None:
+        """
+        Recognition can land after aiRon has already started asking who this is.
+
+        Drop the question silently. Saying "never mind" here would follow a
+        greeting by name with an apology for a conversation aiRon started and
+        then answered for itself, which is how the very first live run of this
+        sounded - it asked André his name, worked it out, welcomed him, and
+        then told him to forget it.
+        """
+        if was is None:
+            return
+        with self._lock:
+            asking = self._asking
+        if asking == was:
+            self._end_conversation()
 
     def _person_left(self, person: str | None) -> None:
         with self._lock:
