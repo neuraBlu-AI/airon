@@ -4,9 +4,10 @@ speech_service's other half: turning an utterance into words.
 Whisper, exported to ONNX and run through sherpa-onnx. That combination was
 chosen because onnxruntime was already on this Jetson and PyTorch is not:
 nothing here needs the GPU, which stays free for the LLM later. Measured on
-this machine with the multilingual base model quantised to int8, a two to
-five second utterance decodes in 0.4-1.2 s, about five times faster than real
-time, after a one-off 1.4 s load.
+this machine with the multilingual small model quantised to int8, a one to
+three second utterance decodes in 1.7 s on average and 2.8 s at worst, after
+a one-off 4.2 s load. Four threads; six is no faster, the CPU is already
+saturated at four.
 
 Two things learned from running it against this microphone, both of which the
 code depends on:
@@ -39,9 +40,35 @@ from ..core import EventBus, EventType
 MODEL_DIR = Path(__file__).resolve().parent.parent.parent / "models" / "asr"
 
 #: Multilingual, so German and English both work without swapping models.
-#: "small" transcribes unusual names noticeably better and costs about three
-#: times the latency; change this and re-run tools/fetch_speech_models.py.
-WHISPER = "base"
+#: Change this and re-run tools/fetch_speech_models.py.
+#:
+#: Measured German, twelve sentences taken from a real session, each scaled to
+#: 0.05 RMS - the level a person across the room actually produces here - and
+#: mixed with noise at three seeds per point. Word error rate, and how many of
+#: the 36 came back exactly right:
+#:
+#:      SNR      base            small
+#:      30 dB    19.5%  17/36    11.3%  23/36
+#:      20 dB    23.0%  15/36    11.9%  22/36
+#:      15 dB    21.3%  13/36    17.0%  20/36
+#:      10 dB    35.7%   3/36    23.5%  15/36
+#:       5 dB    62.5%   0/36    49.7%   6/36
+#:
+#: small wins everywhere and wins by more as the room gets worse, which is the
+#: opposite of a marginal call: at 10 dB base gets three utterances out of
+#: thirty-six right and small gets fifteen. It costs 1.2 s per utterance.
+#:
+#: An earlier note here said small "transcribes unusual names noticeably
+#: better". That does not hold and has been removed. Neither model gets André,
+#: Pierre or aiRon right at any level tested, and small is the one that turns
+#: Elizabeth into "Elitabeth". Names need a way to be corrected, not a bigger
+#: model.
+#:
+#: The same measurement run on Piper's raw output, which sits near full scale,
+#: shows the two models level. That condition is not worth optimising for -
+#: nobody speaks into this microphone at full scale - and it is why the first
+#: version of this comparison reached the wrong conclusion.
+WHISPER = "small"
 
 #: Transcripts that are nothing but a bracketed annotation - "(laughs)",
 #: "[speaking in foreign language]", "*schreit*". All observed from this
