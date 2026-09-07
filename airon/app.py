@@ -23,7 +23,7 @@ from PySide6.QtWidgets import QApplication
 from .audio import AudioService
 from .brain import BrainService
 from .brain.conversation import Conversation
-from .core import EventBus, EventType, StateStore
+from .core import EventBus, EventType, StateStore, load_env
 from .face import FaceAnimator, FaceWindow
 from .memory import MemoryService
 from .speech import Listener, SpeechService
@@ -93,6 +93,13 @@ def start_hearing(bus, args, speech):
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+
+    # Before anything asks for a key. The brain decides whether it has one
+    # the moment it is constructed, so a .env read later than this is a .env
+    # that does nothing.
+    loaded = load_env()
+    if loaded:
+        print(f"[aiRon] .env: {', '.join(sorted(loaded))}")
 
     store = StateStore()
     bus = EventBus()
