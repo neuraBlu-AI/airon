@@ -40,6 +40,24 @@ PRESENCE_GRACE_S = 2.5
 SWITCH_MARGIN_M = 0.30
 SWITCH_HOLD_S = 0.75
 
+#: A tracklet id is the camera's idea of continuity, and it is not good enough
+#: to hang a person on. The OAK drops a tracklet and issues a fresh one for the
+#: same face several times in an ordinary conversation - five PERSON_ENTERED in
+#: one session for one person who never moved. Each of those threw away the
+#: guest id, restarted identification, cleared who the brain was talking to,
+#: and re-triggered the stranger greeting, so aiRon asked somebody it had just
+#: greeted by name who they were.
+#:
+#: So a new tracklet that appears where the old one was, straight after it
+#: vanished, is treated as the same sighting renumbered. Position is what
+#: carries this rather than depth: two people at the same distance were the
+#: whole reason attention needed hysteresis, but they cannot be in the same
+#: place. The window is deliberately shorter than PRESENCE_GRACE_S - past a
+#: second and a half this is somebody arriving, not a renumbering.
+BRIDGE_WINDOW_S = 1.5
+BRIDGE_MOVE = 0.25          # of the frame, in each axis
+BRIDGE_DEPTH_M = 0.60
+
 #: Track states that still count as "this person is here".
 PRESENT = ("NEW", "TRACKED", "LOST")
 #: States good enough to measure an expression from.
@@ -112,6 +130,9 @@ class VisionService:
         self._person: Person | None = None
         self._last_seen = 0.0
         self._switch_since: float | None = None
+        #: (when, x, y, distance) of the attended track, for recognising it
+        #: again under a new number. Cleared whenever somebody actually leaves.
+        self._last_track: tuple[float, float, float, float | None] | None = None
         self._was_looking = False
         self._look_true_at: float | None = None
         self._look_false_at: float | None = None
@@ -357,6 +378,45 @@ class VisionService:
             return nearest
         return current
 
+    @staticmethod
+    def _where(track, frame, now: float):
+        """Where a track is, as fractions of the frame, plus when and how far.
+
+        Normalised so the thresholds mean the same thing whatever resolution
+        the camera is running at.
+        """
+        if track is None or frame is None or getattr(frame.color, "size", 0) == 0:
+            return None
+        height, width = frame.color.shape[:2]
+        if not width or not height:
+            return None
+        x, y, w, h = track.bbox
+        return (now, (x + w / 2) / width, (y + h / 2) / height, track.distance_m)
+
+    def _renumbered(self, track, frame, now: float) -> bool:
+        """Is this new tracklet the one that just vanished, under a new number?
+
+        Only if it turned up in the same place, moments later. A person cannot
+        cross the frame in a second and a half, so somewhere else is somebody
+        else - which is the case this must not swallow, or two people trading
+        places would quietly become one.
+        """
+        if self._last_track is None or track is None:
+            return False
+        when, last_x, last_y, last_distance = self._last_track
+        if now - when > BRIDGE_WINDOW_S:
+            return False
+        here = self._where(track, frame, now)
+        if here is None:
+            return False
+        _, x, y, distance = here
+        if abs(x - last_x) > BRIDGE_MOVE or abs(y - last_y) > BRIDGE_MOVE:
+            return False
+        if (last_distance is not None and distance is not None
+                and abs(distance - last_distance) > BRIDGE_DEPTH_M):
+            return False
+        return True
+
     def _update_person(self, obs, frame, now: float, present: list) -> None:
         track = self._attend(present, now) if present else None
 
@@ -369,13 +429,23 @@ class VisionService:
                 self.bus.publish(EventType.PERSON_LEFT, person=self._person.id)
                 self._person = None
                 self._track_id = None
+                self._last_track = None
             return
 
         self._last_seen = now
         # The id comes from the camera's tracker, so it survives head turns and
         # brief occlusion - which is what stops aiRon greeting you every 20 s.
         track_id = track.id if track is not None else 0
-        if self._person is None or self._track_id != track_id:
+        if self._person is not None and self._track_id != track_id \
+                and self._renumbered(track, frame, now):
+            # The camera lost its grip and started counting again. Same person,
+            # same conversation - adopt the number and say nothing. Publishing
+            # PERSON_LEFT here is what used to make aiRon ask a person it had
+            # just greeted by name who they were.
+            print(f"[vision] track {self._track_id} renumbered {track_id}"
+                  f" - still {self._person.name or self._person.id}")
+            self._track_id = track_id
+        elif self._person is None or self._track_id != track_id:
             if self._person is not None:
                 self.bus.publish(EventType.PERSON_LEFT, person=self._person.id)
             # A guest id until the gallery says otherwise (spec section 12).
@@ -386,6 +456,8 @@ class VisionService:
             self._track_id = track_id
             self._begin_identification(now)
             self.bus.publish(EventType.PERSON_ENTERED, person=self._person.id)
+
+        self._last_track = self._where(track, frame, now)
 
         p = self._person
         p.bbox = obs.bbox
