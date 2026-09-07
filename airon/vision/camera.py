@@ -40,6 +40,22 @@ SHAVES = 6
 FACE_BLOB = f"face-detection-retail-0004_openvino_2022.1_{SHAVES}shave.blob"
 FACE_LABEL = 1
 
+#: Second stage, for face recognition (spec section 12). Landmarks locate five
+#: points inside a detected face; reid turns an aligned crop of it into a
+#: 256-float signature. Both are Intel zoo models designed to follow
+#: face-detection-retail-0004, and both run on the camera beside it.
+#:
+#: The MyriadX has 16 shaves and the detector already holds 6. Four each here
+#: leaves two spare, and costs nothing that matters: the reid network needs
+#: about 40 ms a sample at this width, against a sampling cadence of four a
+#: second. Compiling either for 6 would buy latency aiRon has no use for, at
+#: the price of having nowhere to put the next network.
+LANDMARK_SHAVES = REID_SHAVES = 4
+LANDMARK_BLOB = f"landmarks-regression-retail-0009_openvino_2022.1_{LANDMARK_SHAVES}shave.blob"
+REID_BLOB = f"face-reidentification-retail-0095_openvino_2022.1_{REID_SHAVES}shave.blob"
+LANDMARK_SIZE = 48
+REID_SIZE = 128
+
 #: Detections below this confidence never become tracklets.
 CONFIDENCE = 0.5
 
@@ -94,7 +110,10 @@ class OakCamera:
         self.usb_speed = "unknown"
         self.stream_depth = stream_depth
         self.has_detector = False
+        self.has_recognizer = False
         self._track_q = None
+        self._lm_in = self._lm_out = None
+        self._reid_in = self._reid_out = None
 
         want_depth = self._gate_depth(want_depth, force_depth)
         # Running the stereo pair is what costs headroom, so back the colour
@@ -227,6 +246,7 @@ class OakCamera:
             xtracks = pipeline.create(dai.node.XLinkOut)
             xtracks.setStreamName("tracklets")
             tracker.out.link(xtracks.input)
+            self._build_recognizer(pipeline)
 
         self.device = dai.Device(pipeline)
         self._color_q = self.device.getOutputQueue("color", maxSize=4, blocking=False)
@@ -234,6 +254,100 @@ class OakCamera:
             self._depth_q = self.device.getOutputQueue("depth", maxSize=4, blocking=False)
         if self.has_detector:
             self._track_q = self.device.getOutputQueue("tracklets", maxSize=4, blocking=False)
+        if self.has_recognizer:
+            self._lm_in = self.device.getInputQueue("landmark_in")
+            self._lm_out = self.device.getOutputQueue("landmark_out", maxSize=4, blocking=False)
+            self._reid_in = self.device.getInputQueue("reid_in")
+            self._reid_out = self.device.getOutputQueue("reid_out", maxSize=4, blocking=False)
+
+    def _build_recognizer(self, pipeline) -> None:
+        """
+        Wire up the recognition stages, if their blobs are installed.
+
+        Unlike the detector, these are fed from the host rather than from the
+        colour node: the Jetson has to crop and warp between the two networks,
+        and doing that on the device would mean a Script node reimplementing an
+        affine warp in MicroPython. The frames involved are 7 KB and 49 KB, and
+        only a few go each way per second, so the round trip is cheap.
+        """
+        dai = self.dai
+        blobs = {"landmark": MODEL_DIR / LANDMARK_BLOB, "reid": MODEL_DIR / REID_BLOB}
+        missing = [b.name for b in blobs.values() if not b.exists()]
+        if missing:
+            print(f"[vision] no face recognition: {', '.join(missing)} missing - "
+                  "run tools/fetch_models.py")
+            return
+
+        for name, size in (("landmark", LANDMARK_SIZE), ("reid", REID_SIZE)):
+            xin = pipeline.create(dai.node.XLinkIn)
+            xin.setStreamName(f"{name}_in")
+            xin.setMaxDataSize(size * size * 3)
+            xin.setNumFrames(4)
+
+            nn = pipeline.create(dai.node.NeuralNetwork)
+            nn.setBlobPath(str(blobs[name]))
+            nn.input.setBlocking(False)
+            nn.input.setQueueSize(2)
+            xin.out.link(nn.input)
+
+            xout = pipeline.create(dai.node.XLinkOut)
+            xout.setStreamName(f"{name}_out")
+            nn.out.link(xout.input)
+
+        self.has_recognizer = True
+
+    # ------------------------------------------------- recognition stages
+
+    def _send(self, queue, image: np.ndarray, size: int) -> bool:
+        """Hand one square BGR crop to a host-fed network, planar as it wants."""
+        if queue is None:
+            return False
+        if image.shape[0] != size or image.shape[1] != size:
+            import cv2
+            image = cv2.resize(image, (size, size))
+        frame = self.dai.ImgFrame()
+        frame.setData(np.ascontiguousarray(image.transpose(2, 0, 1)).flatten())
+        frame.setType(self.dai.ImgFrame.Type.BGR888p)
+        frame.setWidth(size)
+        frame.setHeight(size)
+        try:
+            queue.send(frame)
+        except Exception:
+            return False
+        return True
+
+    def send_face_crop(self, image: np.ndarray) -> bool:
+        """Queue a face crop for landmark regression."""
+        return self._send(self._lm_in, image, LANDMARK_SIZE)
+
+    def poll_landmarks(self) -> np.ndarray | None:
+        """Five (x, y) points as fractions of the crop, or None if not ready."""
+        if self._lm_out is None:
+            return None
+        try:
+            packet = self._lm_out.tryGet()
+        except Exception:
+            return None
+        if packet is None:
+            return None
+        return np.array(packet.getFirstLayerFp16(), dtype=np.float32).reshape(5, 2)
+
+    def send_aligned_face(self, image: np.ndarray) -> bool:
+        """Queue an aligned 128x128 face for embedding."""
+        return self._send(self._reid_in, image, REID_SIZE)
+
+    def poll_embedding(self) -> np.ndarray | None:
+        """A unit-length 256-float face signature, or None if not ready."""
+        if self._reid_out is None:
+            return None
+        try:
+            packet = self._reid_out.tryGet()
+        except Exception:
+            return None
+        if packet is None:
+            return None
+        vector = np.array(packet.getFirstLayerFp16(), dtype=np.float32)
+        return vector / max(float(np.linalg.norm(vector)), 1e-9)
 
     def _build_v3(self, want_depth: bool) -> None:
         dai = self.dai

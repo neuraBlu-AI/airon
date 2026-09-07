@@ -35,6 +35,16 @@ class EventType(str, Enum):
     SPEECH_STARTED = "SPEECH_STARTED"
     SPEECH_FINISHED = "SPEECH_FINISHED"
 
+    # Hearing. VOICE_* is the microphone array noticing that a human is
+    # talking, which the face can react to immediately; HEARD arrives about a
+    # second later, once there are words to go with it.
+    VOICE_STARTED = "VOICE_STARTED"
+    VOICE_STOPPED = "VOICE_STOPPED"
+    HEARD = "HEARD"
+
+    # Someone just told aiRon who they are and it stuck.
+    PERSON_NAMED = "PERSON_NAMED"
+
 
 @dataclass
 class Event:

@@ -68,8 +68,12 @@ def main() -> int:
 
             curv, base, open_raw = obs.debug.get("curv", (0.0, 0.0, 0.0))
             distance = f"{person.distance_m:.2f}m" if person and person.distance_m else "--"
+            if person is None:
+                who = "nobody"
+            else:
+                who = f"{person.id} = {person.name}" if person.name else person.id
             hud = [
-                f"{vision.fps:4.1f} fps   depth {distance}",
+                f"{vision.fps:4.1f} fps   depth {distance}   {who}",
                 f"attention {obs.attention_x:+.2f},{obs.attention_y:+.2f}"
                 f"  roll {np.degrees(obs.head_roll):+5.1f}",
                 f"eyes {obs.eyes_open:.2f}  curve {obs.mouth_curve:+.2f}"
