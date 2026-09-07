@@ -1032,7 +1032,7 @@ does not need a ticket branch, but still does not go straight to `main`.
 ## Who Merges
 
 Pull requests are opened by whoever did the work. They are reviewed and merged
-by the repository owner, and by nobody else.
+by André, and by nobody else.
 
 This is not a formality. Every merge so far has been onto a robot that has to
 be stood in front of to be judged: whether a reply arrives quickly enough to
@@ -1049,7 +1049,7 @@ Rules:
   look at while the robot is in front of them.
 - Anything found while working that was not asked for goes in the pull request
   description or a new ticket - not quietly into the branch.
-- If a merge really is wanted immediately, the owner says so in that instance.
+- If a merge really is wanted immediately, André says so in that instance.
   It does not become the habit afterwards.
 - Deleting branches, retargeting a pull request, and closing tickets are part
   of the handover and can be done as asked - it is the merge to `main` that
