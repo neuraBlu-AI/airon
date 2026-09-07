@@ -24,6 +24,7 @@ from .audio import AudioService
 from .brain import BrainService
 from .core import EventBus, EventType, StateStore
 from .face import FaceAnimator, FaceWindow
+from .memory import MemoryService
 from .speech import Listener, SpeechService
 from .vision import VisionService
 
@@ -51,6 +52,8 @@ def parse_args(argv=None):
                         help="run silently, without speech_service")
     parser.add_argument("--no-ears", action="store_true",
                         help="skip the microphone array and speech recognition")
+    parser.add_argument("--no-memory", action="store_true",
+                        help="do not remember anything between runs")
     parser.add_argument("--debug", action="store_true",
                         help="start with the state overlay visible")
     return parser.parse_args(argv)
@@ -124,13 +127,24 @@ def main(argv=None) -> int:
             print("[aiRon] no voices installed - run tools/fetch_voices.py")
             speech = None
 
+    # Before the brain, deliberately: handlers run in subscription order, and
+    # the brain asks memory how long since it last saw you. Memory has to have
+    # noted the arrival before that question is worth asking.
+    memory = None if args.no_memory else MemoryService(bus)
+    if memory is not None:
+        counts = memory.store.stats()
+        print(f"[aiRon] remembers {counts['people']} "
+              f"{'person' if counts['people'] == 1 else 'people'}, "
+              f"{counts['person_memories']} things about them")
+
     ears, listener = start_hearing(bus, args, speech)
 
     app = QApplication(sys.argv[:1])
     animator = FaceAnimator(mirror=not args.no_mirror, speech=speech)
 
     brain = BrainService(bus, speech=speech, vision=vision, face=animator,
-                         lang=args.lang, can_listen=listener is not None)
+                         memory=memory, lang=args.lang,
+                         can_listen=listener is not None)
     brain.start()
 
     def on_camera(event):
