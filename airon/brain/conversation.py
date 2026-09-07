@@ -32,6 +32,7 @@ import os
 import time
 from dataclasses import dataclass, field
 
+from ..core.log import log
 from ..face.expression import EMOTIONS
 
 #: Opus, because the whole point is that aiRon has a personality rather than
@@ -222,7 +223,7 @@ class Conversation:
             )
         except Exception as exc:                    # network, auth, rate limit
             self.last_error = f"{type(exc).__name__}: {str(exc)[:160]}"
-            print(f"[brain] model call failed: {self.last_error}")
+            log(f"[brain] model call failed: {self.last_error}")
             return None
 
         if response.stop_reason == "refusal":

@@ -39,6 +39,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from ..core.log import log
 
 MEMORY_DIR = Path(__file__).resolve().parent.parent.parent / "memories"
 WORLD_FILE = "world.json"
@@ -156,7 +157,7 @@ class MemoryStore:
                 try:
                     record = json.loads(file.read_text())
                 except (OSError, json.JSONDecodeError) as exc:
-                    print(f"[memory] cannot read {file.name}: {exc}")
+                    log(f"[memory] cannot read {file.name}: {exc}")
                     continue
                 if file.name == WORLD_FILE:
                     world = [Memory(**m) for m in record.get("memories", [])]
@@ -164,7 +165,7 @@ class MemoryStore:
                     try:
                         person = Person.from_dict(record)
                     except TypeError as exc:
-                        print(f"[memory] {file.name} is not a person record: {exc}")
+                        log(f"[memory] {file.name} is not a person record: {exc}")
                         continue
                     people[person.person_id] = person
         with self._lock:

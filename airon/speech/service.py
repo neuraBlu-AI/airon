@@ -26,7 +26,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..core import EventBus, EventType
+from ..core import EventBus, EventType, log
 
 VOICE_DIR = Path(__file__).resolve().parent.parent.parent / "voices"
 
@@ -138,7 +138,7 @@ class SpeechService:
                     f"missing voice {model.name}; run tools/fetch_voices.py")
             t0 = time.monotonic()
             self._voices[lang] = PiperVoice.load(model)
-            print(f"[speech] loaded {VOICES[lang]} in {time.monotonic() - t0:.1f}s")
+            log(f"[speech] loaded {VOICES[lang]} in {time.monotonic() - t0:.1f}s")
         return self._voices[lang]
 
     def _run(self) -> None:
@@ -149,7 +149,7 @@ class SpeechService:
             try:
                 self._speak(item)
             except Exception as exc:
-                print(f"[speech] failed to say {item.text!r}: {str(exc)[:100]}")
+                log(f"[speech] failed to say {item.text!r}: {str(exc)[:100]}")
                 with self._lock:
                     self._speaking, self._level = False, 0.0
 

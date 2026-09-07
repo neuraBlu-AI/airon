@@ -19,7 +19,7 @@ from collections import Counter, deque
 
 import numpy as np
 
-from ..core import EventBus, EventType, Person, StateStore, WorldState
+from ..core import EventBus, EventType, Person, StateStore, WorldState, log
 from ..identity import FaceRecognizer, Gallery, Identity
 from .camera import OakCamera, sample_distance
 from .tracker import FaceTracker
@@ -210,7 +210,7 @@ class VisionService:
         detail = f"link {self.camera.usb_speed}"
         if temp is not None:
             detail += f", chip {temp:.1f}C"
-        print(f"[vision] camera stopped delivering frames ({detail}) "
+        log(f"[vision] camera stopped delivering frames ({detail}) "
               f"- going blind, will retry")
         self.bus.publish(EventType.CAMERA_LOST)
         if self._person is not None:
@@ -231,11 +231,11 @@ class VisionService:
         try:
             self.camera = OakCamera(**self._camera_args)
         except Exception as exc:
-            print(f"[vision] reconnect failed: {str(exc)[:90]}")
+            log(f"[vision] reconnect failed: {str(exc)[:90]}")
             return
         self.camera_ok = True
         self.recognizer = self._make_recognizer()
-        print(f"[vision] camera back: {self.camera.name}"
+        log(f"[vision] camera back: {self.camera.name}"
               f"{' with depth' if self.camera.has_depth else ' (no depth)'}")
         self.bus.publish(EventType.CAMERA_READY, depth=self.camera.has_depth)
 
@@ -442,7 +442,7 @@ class VisionService:
             # same conversation - adopt the number and say nothing. Publishing
             # PERSON_LEFT here is what used to make aiRon ask a person it had
             # just greeted by name who they were.
-            print(f"[vision] track {self._track_id} renumbered {track_id}"
+            log(f"[vision] track {self._track_id} renumbered {track_id}"
                   f" - still {self._person.name or self._person.id}")
             self._track_id = track_id
         elif self._person is None or self._track_id != track_id:

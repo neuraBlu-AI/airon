@@ -35,7 +35,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..core import EventBus, EventType
+from ..core import EventBus, EventType, log
 
 MODEL_DIR = Path(__file__).resolve().parent.parent.parent / "models" / "asr"
 
@@ -189,7 +189,7 @@ class Listener:
             warm = self._recognizer.create_stream()
             warm.accept_waveform(16000, np.zeros(16000, dtype=np.float32))
             self._recognizer.decode_stream(warm)
-            print(f"[listener] whisper-{WHISPER} ready in "
+            log(f"[listener] whisper-{WHISPER} ready in "
                   f"{time.monotonic() - started:.1f}s, listening in {self.lang}")
         return self._recognizer
 
@@ -214,7 +214,7 @@ class Listener:
             try:
                 text = self.transcribe(audio)
             except Exception as exc:
-                print(f"[listener] decode failed: {str(exc)[:120]}")
+                log(f"[listener] decode failed: {str(exc)[:120]}")
                 continue
             finally:
                 self.decoding = False

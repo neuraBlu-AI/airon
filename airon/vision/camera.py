@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+from ..core.log import log
 
 # Depth costs frame rate, not bus speed. Measured on this OAK-D Lite: colour 20
 # fps plus aligned depth 10 fps ran for three minutes without a wobble on a USB
@@ -143,7 +144,7 @@ class OakCamera:
         if not want_depth:
             return False
         if self.v3 and not force_depth:
-            print(f"[vision] depthai {self.dai.__version__} cannot read this device's mono "
+            log(f"[vision] depthai {self.dai.__version__} cannot read this device's mono "
                   "sensors, so depth is unavailable. Install 'depthai<3' for range data.")
             return False
         return True
@@ -182,7 +183,7 @@ class OakCamera:
         blob = MODEL_DIR / FACE_BLOB
         self.has_detector = blob.exists()
         if not self.has_detector:
-            print(f"[vision] {FACE_BLOB} missing - run tools/fetch_models.py. "
+            log(f"[vision] {FACE_BLOB} missing - run tools/fetch_models.py. "
                   "Falling back to Haar face detection on the CPU.")
 
         stereo = None
@@ -282,7 +283,7 @@ class OakCamera:
         blobs = {"landmark": MODEL_DIR / LANDMARK_BLOB, "reid": MODEL_DIR / REID_BLOB}
         missing = [b.name for b in blobs.values() if not b.exists()]
         if missing:
-            print(f"[vision] no face recognition: {', '.join(missing)} missing - "
+            log(f"[vision] no face recognition: {', '.join(missing)} missing - "
                   "run tools/fetch_models.py")
             return
 

@@ -23,7 +23,7 @@ from PySide6.QtWidgets import QApplication
 from .audio import AudioService
 from .brain import BrainService
 from .brain.conversation import Conversation
-from .core import EventBus, EventType, StateStore, load_env
+from .core import EventBus, EventType, StateStore, load_env, log
 from .face import FaceAnimator, FaceWindow
 from .face.overlay import build as build_overlays
 from .memory import MemoryService
@@ -85,12 +85,12 @@ def start_hearing(bus, args, speech):
     # display's speakers where the array never hears about it.
     ears = AudioService(bus, is_muted=(lambda: speech.speaking) if speech else None)
     if not ears.available():
-        print("[aiRon] no voice-activity model - run tools/fetch_speech_models.py")
+        log("[aiRon] no voice-activity model - run tools/fetch_speech_models.py")
         return None, None
 
     listener = Listener(bus, ears, lang=args.lang)
     if not listener.available():
-        print("[aiRon] no speech recognition model - run tools/fetch_speech_models.py")
+        log("[aiRon] no speech recognition model - run tools/fetch_speech_models.py")
         return None, None
 
     ears.start()
@@ -106,11 +106,11 @@ def main(argv=None) -> int:
     # that does nothing.
     loaded = load_env()
     if loaded:
-        print(f"[aiRon] .env: {', '.join(sorted(loaded))}")
+        log(f"[aiRon] .env: {', '.join(sorted(loaded))}")
 
     store = StateStore()
     bus = EventBus()
-    bus.subscribe(lambda event: print(f"[event] {event}"))
+    bus.subscribe(lambda event: log(f"[event] {event}"))
 
     try:
         vision = VisionService(store, bus, fps=args.fps,
@@ -119,20 +119,20 @@ def main(argv=None) -> int:
                                depth_fps=args.depth_fps,
                                recognise=not args.no_recognition)
     except Exception as exc:
-        print(f"[aiRon] vision failed to start: {exc}", file=sys.stderr)
+        log(f"[aiRon] vision failed to start: {exc}", err=True)
         return 1
 
     # The link speed is worth saying out loud every time. This OAK-D Lite is
     # USB 3 hardware that has been seen negotiating HIGH, which is a cable
     # rather than a setting, and is invisible unless something prints it.
-    print(f"[aiRon] eyes online: {vision.camera.name}"
+    log(f"[aiRon] eyes online: {vision.camera.name}"
           f"{' with depth' if vision.camera.has_depth else ' (no depth)'}"
           f", link {vision.camera.usb_speed}")
     if vision.recognizer is None:
-        print("[aiRon] face recognition off - everyone will be a guest")
+        log("[aiRon] face recognition off - everyone will be a guest")
     else:
         known = vision.gallery.names()
-        print(f"[aiRon] knows {len(known)} "
+        log(f"[aiRon] knows {len(known)} "
               f"{'person' if len(known) == 1 else 'people'}"
               f"{': ' + ', '.join(known) if known else ' - run tools/enroll_face.py'}")
     vision.start()
@@ -143,9 +143,9 @@ def main(argv=None) -> int:
                                length_scale=args.speech_rate)
         if speech.available():
             speech.start()
-            print(f"[aiRon] voice ready: {', '.join(speech.available())}")
+            log(f"[aiRon] voice ready: {', '.join(speech.available())}")
         else:
-            print("[aiRon] no voices installed - run tools/fetch_voices.py")
+            log("[aiRon] no voices installed - run tools/fetch_voices.py")
             speech = None
 
     # Before the brain, deliberately: handlers run in subscription order, and
@@ -154,7 +154,7 @@ def main(argv=None) -> int:
     memory = None if args.no_memory else MemoryService(bus)
     if memory is not None:
         counts = memory.store.stats()
-        print(f"[aiRon] remembers {counts['people']} "
+        log(f"[aiRon] remembers {counts['people']} "
               f"{'person' if counts['people'] == 1 else 'people'}, "
               f"{counts['person_memories']} things about them")
 
@@ -167,9 +167,9 @@ def main(argv=None) -> int:
     if not args.no_llm:
         conversation = Conversation(lang=args.lang)
         if conversation.available():
-            print(f"[aiRon] conversation: {conversation.model}")
+            log(f"[aiRon] conversation: {conversation.model}")
         else:
-            print(f"[aiRon] no conversation - {conversation.last_error}. "
+            log(f"[aiRon] no conversation - {conversation.last_error}. "
                   "aiRon will still greet people and ask names.")
             conversation = None
 
