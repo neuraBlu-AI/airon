@@ -32,6 +32,7 @@ missed enrolment is not.
 
 from __future__ import annotations
 
+import queue
 import random
 import threading
 import time
@@ -115,12 +116,14 @@ class BrainService:
     """
 
     def __init__(self, bus: EventBus, *, speech=None, vision=None, face=None,
-                 memory=None, lang: str = "en", can_listen: bool = False):
+                 memory=None, conversation=None, lang: str = "en",
+                 can_listen: bool = False):
         self.bus = bus
         self.speech = speech
         self.vision = vision
         self.face = face
         self.memory = memory
+        self.conversation = conversation
         self.lang = lang if lang in LINES else "en"
         self.can_listen = can_listen
 
@@ -134,7 +137,18 @@ class BrainService:
         self._started = 0.0
         self._mirror_was: bool | None = None
 
+        # Who is actually in front of the camera. aiRon only talks to somebody
+        # who is there - the microphone hears the whole room, and a robot that
+        # answers the television is worse company than one that says nothing.
+        self._present: str | None = None
+
+        # The model takes a second or more. It runs here rather than on the
+        # thread that delivered the transcript, so hearing carries on while
+        # aiRon is thinking about what to say.
+        self._jobs: queue.Queue[str | None] = queue.Queue(maxsize=2)
+
         self._thread = threading.Thread(target=self._run, name="brain", daemon=True)
+        self._talker = threading.Thread(target=self._talk, name="brain-llm", daemon=True)
         self._stop = threading.Event()
         bus.subscribe(self._on_event)
 
@@ -142,10 +156,15 @@ class BrainService:
 
     def start(self) -> None:
         self._thread.start()
+        if self.conversation is not None:
+            self._talker.start()
 
     def stop(self) -> None:
         self._stop.set()
+        self._jobs.put(None)
         self._thread.join(timeout=2.0)
+        if self._talker.is_alive():
+            self._talker.join(timeout=3.0)
 
     def _run(self) -> None:
         while not self._stop.wait(0.2):
@@ -161,18 +180,22 @@ class BrainService:
 
     def _on_event(self, event) -> None:
         kind = event.type
-        if kind is EventType.KNOWN_PERSON_DETECTED:
+        if kind is EventType.PERSON_ENTERED:
+            self._present = event.payload.get("person")
+        elif kind is EventType.KNOWN_PERSON_DETECTED:
+            self._present = event.payload.get("person")
             self._recognised_mid_question(event.payload.get("was"))
             self._greet(event.payload.get("person"), event.payload.get("name"),
                         was=event.payload.get("was"))
         elif kind is EventType.UNKNOWN_PERSON_DETECTED:
             self._met_a_stranger(event.payload.get("person"))
         elif kind is EventType.PERSON_NAMED:
+            self._present = event.payload.get("person")
             # Already welcomed by name in _answer(); just make sure the
             # greeting logic does not say hello all over again.
             self._mark_greeted(event.payload.get("person"), event.payload.get("was"))
         elif kind is EventType.HEARD:
-            self._answer(event.payload.get("text", ""))
+            self._heard(event.payload.get("text", ""))
         elif kind is EventType.PERSON_LEFT:
             self._person_left(event.payload.get("person"))
         elif kind is EventType.SPEECH_FINISHED:
@@ -291,10 +314,72 @@ class BrainService:
             self._end_conversation()
 
     def _person_left(self, person: str | None) -> None:
+        if person == self._present:
+            self._present = None
+            self._restore_mirror()
         with self._lock:
             asking = self._asking
         if asking is not None and person == asking:
             self._end_conversation()
+
+    # ----------------------------------------------------------- conversing
+
+    def _heard(self, text: str) -> None:
+        """Somebody said something. Either it answers the question aiRon asked,
+        or it is conversation."""
+        with self._lock:
+            asking = self._asking
+        if asking is not None:
+            self._answer(text)
+        else:
+            self._consider(text)
+
+    def _consider(self, text: str) -> None:
+        """Queue a reply, if there is anybody to reply to."""
+        if self.conversation is None or self._present is None:
+            return
+        try:
+            self._jobs.put_nowait(text)
+        except queue.Full:
+            return                       # already thinking; do not pile up
+        self._suspend_mirror()
+        self._look("thinking")
+
+    def _talk(self) -> None:
+        while not self._stop.is_set():
+            try:
+                text = self._jobs.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if text is None:
+                break
+            self._reply_to(text)
+
+    def _reply_to(self, heard: str) -> None:
+        person = self._present
+        context = self.memory.context_for(person) if self.memory else ""
+        history = self.memory.conversation() if self.memory else []
+
+        reply = self.conversation.reply(heard, context=context, history=history)
+        if reply is None:
+            # Nothing to say beats saying something wrong. The face drops the
+            # thinking look so it does not sit there pretending.
+            self._look("curious")
+            self._restore_mirror()
+            return
+
+        self._look(reply.emotion)
+        if self.speech is not None:
+            self.speech.say(reply.say, lang=self.lang)
+
+        # The model decides what mattered; memory_service decides how long it
+        # lasts. Neither could do the other's half.
+        if self.memory is not None and person is not None:
+            for item in reply.remember:
+                self.memory.remember(
+                    item["text"], person_id=person,
+                    kind=item.get("kind", "episodic"),
+                    importance=float(item.get("importance", 0.4)))
 
     # ------------------------------------------------------------- plumbing
 

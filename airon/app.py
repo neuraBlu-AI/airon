@@ -22,6 +22,7 @@ from PySide6.QtWidgets import QApplication
 
 from .audio import AudioService
 from .brain import BrainService
+from .brain.conversation import Conversation
 from .core import EventBus, EventType, StateStore
 from .face import FaceAnimator, FaceWindow
 from .memory import MemoryService
@@ -54,6 +55,8 @@ def parse_args(argv=None):
                         help="skip the microphone array and speech recognition")
     parser.add_argument("--no-memory", action="store_true",
                         help="do not remember anything between runs")
+    parser.add_argument("--no-llm", action="store_true",
+                        help="stay scripted; do not use the language model")
     parser.add_argument("--debug", action="store_true",
                         help="start with the state overlay visible")
     return parser.parse_args(argv)
@@ -142,8 +145,18 @@ def main(argv=None) -> int:
     app = QApplication(sys.argv[:1])
     animator = FaceAnimator(mirror=not args.no_mirror, speech=speech)
 
+    conversation = None
+    if not args.no_llm:
+        conversation = Conversation(lang=args.lang)
+        if conversation.available():
+            print(f"[aiRon] conversation: {conversation.model}")
+        else:
+            print(f"[aiRon] no conversation - {conversation.last_error}. "
+                  "aiRon will still greet people and ask names.")
+            conversation = None
+
     brain = BrainService(bus, speech=speech, vision=vision, face=animator,
-                         memory=memory, lang=args.lang,
+                         memory=memory, conversation=conversation, lang=args.lang,
                          can_listen=listener is not None)
     brain.start()
 
