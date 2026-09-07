@@ -32,6 +32,7 @@ missed enrolment is not.
 
 from __future__ import annotations
 
+import queue
 import random
 import threading
 import time
@@ -106,6 +107,12 @@ LINES = {
 }
 
 
+#: How many fragments heard mid-thought are folded into the next turn.
+#: Enough for a sentence the VAD chopped up; not so many that aiRon
+#: answers a paragraph nobody remembers saying.
+MAX_PENDING = 3
+
+
 class BrainService:
     """
     Decides what aiRon does about the people it can see.
@@ -115,12 +122,14 @@ class BrainService:
     """
 
     def __init__(self, bus: EventBus, *, speech=None, vision=None, face=None,
-                 memory=None, lang: str = "en", can_listen: bool = False):
+                 memory=None, conversation=None, lang: str = "en",
+                 can_listen: bool = False):
         self.bus = bus
         self.speech = speech
         self.vision = vision
         self.face = face
         self.memory = memory
+        self.conversation = conversation
         self.lang = lang if lang in LINES else "en"
         self.can_listen = can_listen
 
@@ -134,7 +143,25 @@ class BrainService:
         self._started = 0.0
         self._mirror_was: bool | None = None
 
+        # Who is actually in front of the camera. aiRon only talks to somebody
+        # who is there - the microphone hears the whole room, and a robot that
+        # answers the television is worse company than one that says nothing.
+        self._present: str | None = None
+
+        # The model takes a second or more. It runs here rather than on the
+        # thread that delivered the transcript, so hearing carries on while
+        # aiRon is thinking about what to say.
+        self._jobs: queue.Queue[str | None] = queue.Queue(maxsize=2)
+
+        # Anything heard while a reply is being composed waits here and joins
+        # the next turn instead of starting one of its own. Guarded by _lock
+        # together with _busy, so the talker can only go idle at a moment when
+        # there is genuinely nothing waiting.
+        self._busy = False
+        self._pending: list[str] = []
+
         self._thread = threading.Thread(target=self._run, name="brain", daemon=True)
+        self._talker = threading.Thread(target=self._talk, name="brain-llm", daemon=True)
         self._stop = threading.Event()
         bus.subscribe(self._on_event)
 
@@ -142,10 +169,15 @@ class BrainService:
 
     def start(self) -> None:
         self._thread.start()
+        if self.conversation is not None:
+            self._talker.start()
 
     def stop(self) -> None:
         self._stop.set()
+        self._jobs.put(None)
         self._thread.join(timeout=2.0)
+        if self._talker.is_alive():
+            self._talker.join(timeout=3.0)
 
     def _run(self) -> None:
         while not self._stop.wait(0.2):
@@ -161,18 +193,22 @@ class BrainService:
 
     def _on_event(self, event) -> None:
         kind = event.type
-        if kind is EventType.KNOWN_PERSON_DETECTED:
+        if kind is EventType.PERSON_ENTERED:
+            self._present = event.payload.get("person")
+        elif kind is EventType.KNOWN_PERSON_DETECTED:
+            self._present = event.payload.get("person")
             self._recognised_mid_question(event.payload.get("was"))
             self._greet(event.payload.get("person"), event.payload.get("name"),
                         was=event.payload.get("was"))
         elif kind is EventType.UNKNOWN_PERSON_DETECTED:
             self._met_a_stranger(event.payload.get("person"))
         elif kind is EventType.PERSON_NAMED:
+            self._present = event.payload.get("person")
             # Already welcomed by name in _answer(); just make sure the
             # greeting logic does not say hello all over again.
             self._mark_greeted(event.payload.get("person"), event.payload.get("was"))
         elif kind is EventType.HEARD:
-            self._answer(event.payload.get("text", ""))
+            self._heard(event.payload.get("text", ""))
         elif kind is EventType.PERSON_LEFT:
             self._person_left(event.payload.get("person"))
         elif kind is EventType.SPEECH_FINISHED:
@@ -291,10 +327,108 @@ class BrainService:
             self._end_conversation()
 
     def _person_left(self, person: str | None) -> None:
+        if person == self._present:
+            self._present = None
+            self._restore_mirror()
         with self._lock:
             asking = self._asking
         if asking is not None and person == asking:
             self._end_conversation()
+
+    # ----------------------------------------------------------- conversing
+
+    def _heard(self, text: str) -> None:
+        """Somebody said something. Either it answers the question aiRon asked,
+        or it is conversation."""
+        with self._lock:
+            asking = self._asking
+        if asking is not None:
+            self._answer(text)
+        else:
+            self._consider(text)
+
+    def _consider(self, text: str) -> None:
+        """Queue a reply, if there is anybody to reply to."""
+        if self.conversation is None or self._present is None:
+            return
+        with self._lock:
+            if self._busy:
+                # Already composing. The VAD ends an utterance on half a second
+                # of silence, which splits one sentence in two far more often
+                # than a person says two separate things that fast, so this
+                # belongs to the turn in progress rather than to a new one.
+                # Answering both is how aiRon said "Ein Lamborghini, in Blau,
+                # nehme ich an?" twice in a row.
+                self._pending.append(text)
+                del self._pending[:-MAX_PENDING]
+                return
+            self._busy = True
+        try:
+            self._jobs.put_nowait(text)
+        except queue.Full:
+            with self._lock:
+                self._busy = False
+            return
+        self._suspend_mirror()
+        self._look("thinking")
+
+    def _next_turn(self) -> str | None:
+        """What was said while aiRon was thinking, as one turn, or None.
+
+        Clearing _busy happens here and only here, under the lock that
+        _consider checks, so there is no gap where an utterance is filed as
+        pending by a talker that has already decided it has nothing to do.
+        """
+        with self._lock:
+            if not self._pending:
+                self._busy = False
+                return None
+            text = " ".join(self._pending)
+            self._pending.clear()
+            return text
+
+    def _talk(self) -> None:
+        while not self._stop.is_set():
+            try:
+                text = self._jobs.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if text is None:
+                break
+            while text is not None:
+                try:
+                    self._reply_to(text)
+                except Exception as exc:      # never strand _busy set
+                    print(f"[brain] reply failed: {str(exc)[:120]}")
+                text = self._next_turn()
+                if text is not None:
+                    self._look("thinking")
+
+    def _reply_to(self, heard: str) -> None:
+        person = self._present
+        context = self.memory.context_for(person) if self.memory else ""
+        history = self.memory.conversation() if self.memory else []
+
+        reply = self.conversation.reply(heard, context=context, history=history)
+        if reply is None:
+            # Nothing to say beats saying something wrong. The face drops the
+            # thinking look so it does not sit there pretending.
+            self._look("curious")
+            self._restore_mirror()
+            return
+
+        self._look(reply.emotion)
+        if self.speech is not None:
+            self.speech.say(reply.say, lang=self.lang)
+
+        # The model decides what mattered; memory_service decides how long it
+        # lasts. Neither could do the other's half.
+        if self.memory is not None and person is not None:
+            for item in reply.remember:
+                self.memory.remember(
+                    item["text"], person_id=person,
+                    kind=item.get("kind", "episodic"),
+                    importance=float(item.get("importance", 0.4)))
 
     # ------------------------------------------------------------- plumbing
 

@@ -38,16 +38,47 @@ RATE = 16000
 CHANNELS = 2          # what the XVF3800 offers; we keep channel 0
 CHANNEL = 0
 
+#: How long to wait before trying the microphone again after it drops out,
+#: and how far to back off if it keeps failing. USB audio devices wedge -
+#: a hub renumbers, the bus glitches, the XVF3800 returns EIO on every read
+#: until something resets it. None of that should cost aiRon its hearing for
+#: the rest of the run, and none of it should turn into a spin loop against
+#: a device that is genuinely gone.
+REOPEN_DELAY_S = 2.0
+REOPEN_MAX_DELAY_S = 30.0
+
 #: Silero's frame size at 16 kHz. Feeding it exactly this avoids any
 #: re-buffering inside the detector.
 WINDOW = 512
 
 #: Utterance shape. A name is short, so speech has to be allowed to be short
 #: too; the silence figure is what decides how long aiRon waits before deciding
-#: you have finished, and half a second is about the pause people leave between
-#: sentences without meaning to hand over.
+#: you have finished.
+#:
+#: Half a second was too little, and it showed up as aiRon losing the end of
+#: sentences: "Was würdest du mir für Schuhe emp", "Was weißt du über",
+#: "aiRon, ich hab eine". Measured by taking five sentences that were actually
+#: cut in a live session, splitting each at the point it broke, and inserting
+#: a real pause - how many of the five came back in one piece rather than two:
+#:
+#:      pause    0.5 s   0.7 s   0.9 s   1.2 s
+#:      0.3 s     4/5     5/5     5/5     5/5
+#:      0.4 s     1/5     4/5     5/5     5/5
+#:      0.5 s     0/5     3/5     5/5     5/5
+#:      0.6 s     0/5     0/5     4/5     5/5
+#:      0.8 s     0/5     0/5     1/5     5/5
+#:
+#: A 0.4 s breath in the middle of a sentence broke four of five at the old
+#: value, and 0.4 s is an ordinary hesitation rather than handing over a turn.
+#: 0.9 s holds a sentence together through the pauses people actually leave
+#: while still treating 0.8 s as finished, which it usually is - past about a
+#: second a person listening would answer too.
+#:
+#: It costs 0.4 s before aiRon starts thinking, on every turn. Worth it: the
+#: alternative is answering half a question, and then answering the other half
+#: separately, which costs a whole exchange.
 MIN_SPEECH_S = 0.25
-MIN_SILENCE_S = 0.5
+MIN_SILENCE_S = 0.9
 MAX_SPEECH_S = 12.0
 
 #: How long after aiRon stops talking before it trusts the microphone again.
@@ -128,8 +159,12 @@ class AudioService:
 
     def stop(self) -> None:
         self._stop.set()
-        if self._proc is not None:
-            self._proc.terminate()
+        proc = self._proc                   # may be cleared by the audio thread
+        if proc is not None:
+            try:
+                proc.terminate()            # unblock the read
+            except OSError:
+                pass
         self._thread.join(timeout=3.0)
 
     # --------------------------------------------------------------- inner
@@ -152,25 +187,89 @@ class AudioService:
             self._proc = subprocess.Popen(
                 ["arecord", "-D", self.device, "-f", "S16_LE", "-c", str(CHANNELS),
                  "-r", str(RATE), "-t", "raw", "-q"],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         except OSError as exc:
             print(f"[audio] cannot open {self.device}: {exc}")
             return False
         return True
 
+    def _why_it_stopped(self) -> str:
+        """Whatever arecord said on its way out. Kept, rather than sent to
+        /dev/null, because "read error: Input/output error" is the difference
+        between a wedged USB device and a robot that is merely in a quiet
+        room, and the two look identical from the far end of the pipe."""
+        if self._proc is None:
+            return ""
+        # Make sure it is actually dead first: reading stderr of a process
+        # that is still alive blocks until it decides to say something, and
+        # this runs on the thread that carries every word aiRon hears.
+        try:
+            self._proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+        except OSError:
+            return ""
+        try:
+            err = (self._proc.stderr.read() or b"").decode("utf-8", "replace")
+        except (OSError, ValueError):
+            return ""
+        lines = [l.strip() for l in err.splitlines()
+                 if l.strip() and not l.startswith("Recording raw data")]
+        return lines[-1] if lines else ""
+
+    def _close(self) -> None:
+        if self._proc is None:
+            return
+        for stream in (self._proc.stdout, self._proc.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except OSError:
+                pass
+        try:
+            self._proc.terminate()
+            self._proc.wait(timeout=1.0)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        self._proc = None
+
     def _run(self) -> None:
         self._vad = self._build_vad()
-        if not self._open():
-            return
-        print(f"[audio] listening on {self.device}")
-
         nbytes = WINDOW * CHANNELS * 2
         muted_until_quiet = False
+        delay = REOPEN_DELAY_S
+        announced = False
 
         while not self._stop.is_set():
+            if self._proc is None:
+                if not self._open():
+                    return
+                if not announced:
+                    print(f"[audio] listening on {self.device}")
+                    announced = True
+
             raw = self._proc.stdout.read(nbytes)
             if not raw or len(raw) < nbytes:
-                break
+                # The device stopped. Say why, drop what the detector had
+                # half-built, and try again - deafness should last seconds,
+                # not the rest of the run.
+                why = self._why_it_stopped()
+                self._close()
+                self._set_level(0.0)
+                if self._stop.is_set():
+                    break
+                print(f"[audio] microphone stopped delivering samples"
+                      f"{': ' + why if why else ''}; retrying in {delay:.0f}s")
+                self._vad.reset()
+                muted_until_quiet = False
+                if self._stop.wait(delay):
+                    break
+                delay = min(delay * 2, REOPEN_MAX_DELAY_S)
+                continue
+
+            if delay != REOPEN_DELAY_S:
+                print("[audio] microphone back")
+                delay = REOPEN_DELAY_S
 
             block = np.frombuffer(raw, np.int16).reshape(-1, CHANNELS)
             mono = block[:, CHANNEL].astype(np.float32) / 32768.0
@@ -201,8 +300,7 @@ class AudioService:
                 self._offer(segment)
 
         self._set_level(0.0)
-        if not self._stop.is_set():
-            print("[audio] microphone stopped delivering samples")
+        self._close()
 
     def _offer(self, segment: np.ndarray) -> None:
         """Queue an utterance, dropping the oldest if nothing is draining."""

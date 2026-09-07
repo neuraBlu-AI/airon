@@ -22,7 +22,8 @@ from PySide6.QtWidgets import QApplication
 
 from .audio import AudioService
 from .brain import BrainService
-from .core import EventBus, EventType, StateStore
+from .brain.conversation import Conversation
+from .core import EventBus, EventType, StateStore, load_env
 from .face import FaceAnimator, FaceWindow
 from .memory import MemoryService
 from .speech import Listener, SpeechService
@@ -54,6 +55,8 @@ def parse_args(argv=None):
                         help="skip the microphone array and speech recognition")
     parser.add_argument("--no-memory", action="store_true",
                         help="do not remember anything between runs")
+    parser.add_argument("--no-llm", action="store_true",
+                        help="stay scripted; do not use the language model")
     parser.add_argument("--debug", action="store_true",
                         help="start with the state overlay visible")
     return parser.parse_args(argv)
@@ -91,6 +94,13 @@ def start_hearing(bus, args, speech):
 def main(argv=None) -> int:
     args = parse_args(argv)
 
+    # Before anything asks for a key. The brain decides whether it has one
+    # the moment it is constructed, so a .env read later than this is a .env
+    # that does nothing.
+    loaded = load_env()
+    if loaded:
+        print(f"[aiRon] .env: {', '.join(sorted(loaded))}")
+
     store = StateStore()
     bus = EventBus()
     bus.subscribe(lambda event: print(f"[event] {event}"))
@@ -105,8 +115,12 @@ def main(argv=None) -> int:
         print(f"[aiRon] vision failed to start: {exc}", file=sys.stderr)
         return 1
 
+    # The link speed is worth saying out loud every time. This OAK-D Lite is
+    # USB 3 hardware that has been seen negotiating HIGH, which is a cable
+    # rather than a setting, and is invisible unless something prints it.
     print(f"[aiRon] eyes online: {vision.camera.name}"
-          f"{' with depth' if vision.camera.has_depth else ' (no depth)'}")
+          f"{' with depth' if vision.camera.has_depth else ' (no depth)'}"
+          f", link {vision.camera.usb_speed}")
     if vision.recognizer is None:
         print("[aiRon] face recognition off - everyone will be a guest")
     else:
@@ -142,8 +156,18 @@ def main(argv=None) -> int:
     app = QApplication(sys.argv[:1])
     animator = FaceAnimator(mirror=not args.no_mirror, speech=speech)
 
+    conversation = None
+    if not args.no_llm:
+        conversation = Conversation(lang=args.lang)
+        if conversation.available():
+            print(f"[aiRon] conversation: {conversation.model}")
+        else:
+            print(f"[aiRon] no conversation - {conversation.last_error}. "
+                  "aiRon will still greet people and ask names.")
+            conversation = None
+
     brain = BrainService(bus, speech=speech, vision=vision, face=animator,
-                         memory=memory, lang=args.lang,
+                         memory=memory, conversation=conversation, lang=args.lang,
                          can_listen=listener is not None)
     brain.start()
 

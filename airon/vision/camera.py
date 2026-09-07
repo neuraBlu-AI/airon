@@ -21,9 +21,17 @@ import numpy as np
 
 # Depth costs frame rate, not bus speed. Measured on this OAK-D Lite: colour 20
 # fps plus aligned depth 10 fps ran for three minutes without a wobble on a USB
-# 2 link (chip plateaued near 50 C), while colour 30 plus mono 30 crashed the
-# device inside a minute even at SuperSpeed. So the rates below are the default
-# whenever depth is on, on any link, and --fps / --depth-fps override them.
+# 2 link, while colour 30 plus mono 30 crashed the device inside a minute even
+# at SuperSpeed. So the rates below are the default whenever depth is on, on
+# any link, and --fps / --depth-fps override them.
+#
+# That first measurement noted the chip "plateaued near 50 C", and that part has
+# not held up. Soaked for five and a half minutes at these exact rates it went
+# 61 C to 69 C and was still climbing when the test ended - no plateau at all.
+# Nothing dropped a frame in that window, so this is not a known failure point,
+# but it is the reason temperature is now reported rather than assumed: a
+# session that had been running far longer than any test did go blind
+# repeatedly, and there was no thermal record to look at afterwards.
 #
 # (An earlier version gated depth on a SuperSpeed link. That was wrong: it came
 # from depth failing under depthai v3, where the mono sensors never delivered a
@@ -379,6 +387,19 @@ class OakCamera:
             self.usb_speed = str(device.getUsbSpeed()).split(".")[-1]
         except Exception:
             pass
+
+    def chip_temperature(self) -> float | None:
+        """Average die temperature in C, or None if the device cannot be asked.
+
+        Cheap enough to call on a stall, which is the moment it matters: a
+        camera that stopped delivering frames at 70 C and one that stopped at
+        50 C are different faults, and after the fact they look identical.
+        """
+        try:
+            device = self.pipeline.getDefaultDevice() if self.v3 else self.device
+            return float(device.getChipTemperature().average)
+        except Exception:
+            return None
 
     def _verify(self) -> bool:
         """

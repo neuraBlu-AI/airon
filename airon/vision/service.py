@@ -29,6 +29,17 @@ from .tracker import FaceTracker
 # before REMOVED, so this no longer has to paper over a fragile detector.
 PRESENCE_GRACE_S = 2.5
 
+#: Attention is sticky. Recomputing "who is nearest" every frame sounds right
+#: and is not: the camera's tracker will happily hold two tracklets on one
+#: face, and with a few centimetres of depth noise between them the nearest
+#: swaps many times a second. Every swap was a PERSON_LEFT and a
+#: PERSON_ENTERED - ninety of them in one session, which cost aiRon the
+#: person's identity, the conversation, and any idea of who it was talking to.
+#: Somebody else takes attention by being clearly nearer, for long enough to
+#: mean it.
+SWITCH_MARGIN_M = 0.30
+SWITCH_HOLD_S = 0.75
+
 #: Track states that still count as "this person is here".
 PRESENT = ("NEW", "TRACKED", "LOST")
 #: States good enough to measure an expression from.
@@ -100,6 +111,7 @@ class VisionService:
         self._track_id: int | None = None
         self._person: Person | None = None
         self._last_seen = 0.0
+        self._switch_since: float | None = None
         self._was_looking = False
         self._look_true_at: float | None = None
         self._look_false_at: float | None = None
@@ -169,7 +181,16 @@ class VisionService:
         self.camera_ok = False
         self.fps = 0.0
         self._next_retry = time.monotonic() + RECONNECT_EVERY_S
-        print("[vision] camera stopped delivering frames - going blind, will retry")
+        # Ask the device why while it is still there to ask. A stall at 70 C on
+        # a High Speed link and a stall at 50 C on SuperSpeed are different
+        # faults, and once the pipeline is torn down both look like this one
+        # line. Read before close(), because close() takes the answer with it.
+        temp = self.camera.chip_temperature()
+        detail = f"link {self.camera.usb_speed}"
+        if temp is not None:
+            detail += f", chip {temp:.1f}C"
+        print(f"[vision] camera stopped delivering frames ({detail}) "
+              f"- going blind, will retry")
         self.bus.publish(EventType.CAMERA_LOST)
         if self._person is not None:
             self.bus.publish(EventType.PERSON_LEFT, person=self._person.id)
@@ -303,14 +324,41 @@ class VisionService:
             self._said_unknown = True
             self.bus.publish(EventType.UNKNOWN_PERSON_DETECTED, person=person.id)
 
+    def _attend(self, present: list, now: float):
+        """Who aiRon is watching, with hysteresis.
+
+        Whoever is nearest has aiRon's attention; without depth, whoever fills
+        most of the frame. But once somebody has it they keep it while they are
+        still on screen, because the alternative - deciding again from scratch
+        every frame - turns depth noise between two tracklets into a stream of
+        people arriving and leaving.
+        """
+        ranged = [t for t in present if t.distance_m]
+        nearest = (min(ranged, key=lambda t: t.distance_m) if ranged
+                   else max(present, key=lambda t: t.bbox[2] * t.bbox[3]))
+
+        current = next((t for t in present if t.id == self._track_id), None)
+        if current is None or nearest is current:
+            self._switch_since = None
+            return nearest
+
+        # Somebody else is on screen. Nearer by enough to be a different
+        # person rather than a different estimate of the same one?
+        clearly_nearer = (current.distance_m is not None
+                          and nearest.distance_m is not None
+                          and current.distance_m - nearest.distance_m > SWITCH_MARGIN_M)
+        if not clearly_nearer:
+            self._switch_since = None
+            return current
+        if self._switch_since is None:
+            self._switch_since = now
+        if now - self._switch_since >= SWITCH_HOLD_S:
+            self._switch_since = None
+            return nearest
+        return current
+
     def _update_person(self, obs, frame, now: float, present: list) -> None:
-        track = None
-        if present:
-            # Whoever is nearest has aiRon's attention; without depth, whoever
-            # fills most of the frame.
-            ranged = [t for t in present if t.distance_m]
-            track = (min(ranged, key=lambda t: t.distance_m) if ranged
-                     else max(present, key=lambda t: t.bbox[2] * t.bbox[3]))
+        track = self._attend(present, now) if present else None
 
         measurable = track is not None and track.status in MEASURABLE
         obs = self.tracker.update(frame.color, self._dt,
