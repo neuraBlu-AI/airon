@@ -13,6 +13,7 @@ import threading
 from collections.abc import Callable
 
 from .events import Event, EventType, WorldState
+from .log import log
 
 
 class EventBus:
@@ -34,7 +35,7 @@ class EventBus:
             try:
                 handler(event)
             except Exception as exc:                      # one bad subscriber
-                print(f"[bus] handler {handler!r} raised: {exc}")   # must not
+                log(f"[bus] handler {handler!r} raised: {exc}")   # must not
         return event                                      # stop the others
 
 

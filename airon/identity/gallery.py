@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+from ..core.log import log
 
 GALLERY_DIR = Path(__file__).resolve().parent.parent.parent / "known_faces"
 INDEX_FILE = "gallery.json"
@@ -123,7 +124,7 @@ class Gallery:
         try:
             records = json.loads(index.read_text())
         except (OSError, json.JSONDecodeError) as exc:
-            print(f"[gallery] cannot read {index}: {exc}")
+            log(f"[gallery] cannot read {index}: {exc}")
             return
 
         loaded: dict[str, Identity] = {}
@@ -133,10 +134,10 @@ class Gallery:
             try:
                 vectors = normalise(np.load(vectors_file))
             except OSError as exc:
-                print(f"[gallery] {person_id} has no vectors ({exc}); skipping")
+                log(f"[gallery] {person_id} has no vectors ({exc}); skipping")
                 continue
             if vectors.shape[1] != EMBEDDING_DIM:
-                print(f"[gallery] {person_id} has {vectors.shape[1]}-d vectors, "
+                log(f"[gallery] {person_id} has {vectors.shape[1]}-d vectors, "
                       f"expected {EMBEDDING_DIM}; skipping")
                 continue
             loaded[person_id] = Identity(

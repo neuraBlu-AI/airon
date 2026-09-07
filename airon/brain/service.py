@@ -36,7 +36,7 @@ import random
 import threading
 import time
 
-from ..core import EventBus, EventType
+from ..core import EventBus, EventType, log
 from ..memory.service import LONG_ABSENCE_S
 from .naming import is_refusal, parse_name
 
@@ -414,7 +414,7 @@ class BrainService:
             try:
                 self._reply_to(text)
             except Exception as exc:
-                print(f"[brain] reply failed: {str(exc)[:120]}")
+                log(f"[brain] reply failed: {str(exc)[:120]}")
 
     def _reply_to(self, heard: str) -> None:
         person = self._present

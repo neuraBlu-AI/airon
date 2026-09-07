@@ -29,7 +29,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..core import EventBus, EventType
+from ..core import EventBus, EventType, log
 
 MODEL_DIR = Path(__file__).resolve().parent.parent.parent / "models" / "asr"
 VAD_MODEL = MODEL_DIR / "silero_vad.onnx"
@@ -189,7 +189,7 @@ class AudioService:
                  "-r", str(RATE), "-t", "raw", "-q"],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         except OSError as exc:
-            print(f"[audio] cannot open {self.device}: {exc}")
+            log(f"[audio] cannot open {self.device}: {exc}")
             return False
         return True
 
@@ -245,7 +245,7 @@ class AudioService:
                 if not self._open():
                     return
                 if not announced:
-                    print(f"[audio] listening on {self.device}")
+                    log(f"[audio] listening on {self.device}")
                     announced = True
 
             raw = self._proc.stdout.read(nbytes)
@@ -258,7 +258,7 @@ class AudioService:
                 self._set_level(0.0)
                 if self._stop.is_set():
                     break
-                print(f"[audio] microphone stopped delivering samples"
+                log(f"[audio] microphone stopped delivering samples"
                       f"{': ' + why if why else ''}; retrying in {delay:.0f}s")
                 self._vad.reset()
                 muted_until_quiet = False
@@ -268,7 +268,7 @@ class AudioService:
                 continue
 
             if delay != REOPEN_DELAY_S:
-                print("[audio] microphone back")
+                log("[audio] microphone back")
                 delay = REOPEN_DELAY_S
 
             block = np.frombuffer(raw, np.int16).reshape(-1, CHANNELS)
