@@ -26,7 +26,11 @@ import re
 LEAD_INS = [
     r"name\s+(?:is|ist)\s+",
     r"\bi\s*(?:'m|’m|\s+am)\s+",
-    r"\bich\s+hei(?:ß|ss)e\s+",
+    # Not anchored to "ich", and loose about the verb ending, because this is
+    # exactly where whisper-base fails: "Ich heiße André" came back as "Mich
+    # heißt der André". Requiring the pronoun and the -e ending threw away a
+    # sentence that says the name perfectly clearly.
+    r"hei(?:ß|ss)(?:e|t|en|st)?\s+",
     r"\bich\s+bin\s+",
     r"\b(?:you\s+can\s+)?call\s+me\s+",
     r"\b(?:man\s+)?nenn(?:t|e)?\s+mich\s+",
@@ -37,6 +41,12 @@ LEAD_INS = [
 
 #: A name-shaped word: letters, and the punctuation real names contain.
 WORD = re.compile(r"^[^\W\d_][\w'’\-]{1,19}$", re.UNICODE)
+
+#: Articles that end up in front of a name, either because the speaker used
+#: one - "Ich bin der André" is ordinary German - or because whisper inserted
+#: it. Skipped rather than rejected: hitting one means the name is the next
+#: word along, not that there is no name.
+ARTICLES = {"der", "die", "das", "den", "the"}
 
 #: Shaped like a name, but nobody is called this. Answers to "what is your
 #: name?" that mean something other than a name.
@@ -113,7 +123,10 @@ def parse_name(text: str) -> str | None:
         if len(_fold(text).split()) > 2:
             return None
 
-    words = [w for w in re.split(r"[\s,]+", _clean(remainder)) if w][:2]
+    words = [w for w in re.split(r"[\s,]+", _clean(remainder)) if w]
+    while words and words[0].casefold() in ARTICLES:
+        words.pop(0)
+    words = words[:2]
     if not words:
         return None
 
