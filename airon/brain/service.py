@@ -429,18 +429,48 @@ class BrainService:
             self._restore_mirror()
             return
 
+        # Composed for whoever was there when they spoke. Six to nine seconds
+        # later, that may not be who is standing here now - and the reply is
+        # built around their name and what aiRon remembers about them. Said to
+        # the wrong person it is not merely stale, it is wrong about who they
+        # are: André was told "Ja, Max, so heißt du doch" because Max had asked
+        # the question and left while the answer was being written.
+        #
+        # So it is dropped rather than redirected. It cannot be rewritten for
+        # somebody else without asking the model again, and saying nothing to a
+        # person aiRon has not answered is a much smaller failure than calling
+        # them by another person's name.
+        if self._present != person:
+            log(f"[brain] not saying that - it was for "
+                f"{person or 'nobody'}, and {self._present or 'nobody'} is here now")
+            self._look("curious")
+            self._restore_mirror()
+            self._remember(reply, person)
+            return
+
         self._look(reply.emotion)
         if self.speech is not None:
             self.speech.say(reply.say, lang=self.lang)
 
+        self._remember(reply, person)
+
+    def _remember(self, reply, person: str | None) -> None:
+        """
+        Keep what the model judged worth keeping.
+
+        Filed against whoever actually said it, not whoever is in front of the
+        camera now, and kept even when the reply itself went unsaid: they still
+        told aiRon their favourite colour, whether or not it ever answered.
+        """
         # The model decides what mattered; memory_service decides how long it
         # lasts. Neither could do the other's half.
-        if self.memory is not None and person is not None:
-            for item in reply.remember:
-                self.memory.remember(
-                    item["text"], person_id=person,
-                    kind=item.get("kind", "episodic"),
-                    importance=float(item.get("importance", 0.4)))
+        if self.memory is None or person is None:
+            return
+        for item in reply.remember:
+            self.memory.remember(
+                item["text"], person_id=person,
+                kind=item.get("kind", "episodic"),
+                importance=float(item.get("importance", 0.4)))
 
     # ------------------------------------------------------------- plumbing
 
