@@ -32,7 +32,6 @@ missed enrolment is not.
 
 from __future__ import annotations
 
-import queue
 import random
 import threading
 import time
@@ -107,10 +106,22 @@ LINES = {
 }
 
 
-#: How many fragments heard mid-thought are folded into the next turn.
-#: Enough for a sentence the VAD chopped up; not so many that aiRon
-#: answers a paragraph nobody remembers saying.
-MAX_PENDING = 3
+#: How many fragments are folded into one turn. Enough for a sentence the VAD
+#: chopped up; not so many that aiRon answers a paragraph nobody remembers
+#: saying.
+MAX_FRAGMENTS = 3
+
+#: Quiet needed before aiRon accepts that a turn is over: nobody speaking, no
+#: audio waiting to be transcribed, no decode running, and this long since the
+#: last words arrived.
+#:
+#: Short, because it is only the tail of the wait. The expensive part is
+#: waiting for the evidence to settle, and that ends by itself the moment the
+#: room goes quiet and the last decode lands.
+SETTLE_S = 0.4
+
+#: How often the talker looks at whether the turn has finished.
+POLL_S = 0.1
 
 
 class BrainService:
@@ -123,13 +134,17 @@ class BrainService:
 
     def __init__(self, bus: EventBus, *, speech=None, vision=None, face=None,
                  memory=None, conversation=None, lang: str = "en",
-                 can_listen: bool = False):
+                 can_listen: bool = False, ears=None, listener=None):
         self.bus = bus
         self.speech = speech
         self.vision = vision
         self.face = face
         self.memory = memory
         self.conversation = conversation
+        # Not used to hear with - the bus already delivers that - but to ask
+        # whether hearing has finished. See _turn_over.
+        self.ears = ears
+        self.listener = listener
         self.lang = lang if lang in LINES else "en"
         self.can_listen = can_listen
 
@@ -148,17 +163,11 @@ class BrainService:
         # answers the television is worse company than one that says nothing.
         self._present: str | None = None
 
-        # The model takes a second or more. It runs here rather than on the
-        # thread that delivered the transcript, so hearing carries on while
-        # aiRon is thinking about what to say.
-        self._jobs: queue.Queue[str | None] = queue.Queue(maxsize=2)
-
-        # Anything heard while a reply is being composed waits here and joins
-        # the next turn instead of starting one of its own. Guarded by _lock
-        # together with _busy, so the talker can only go idle at a moment when
-        # there is genuinely nothing waiting.
-        self._busy = False
-        self._pending: list[str] = []
+        # What has been heard but not yet answered. The model call runs on the
+        # talker thread rather than the one that delivered the transcript, so
+        # hearing carries on while aiRon is thinking about what to say.
+        self._buffer: list[str] = []
+        self._heard_at = 0.0
 
         self._thread = threading.Thread(target=self._run, name="brain", daemon=True)
         self._talker = threading.Thread(target=self._talk, name="brain-llm", daemon=True)
@@ -174,7 +183,6 @@ class BrainService:
 
     def stop(self) -> None:
         self._stop.set()
-        self._jobs.put(None)
         self._thread.join(timeout=2.0)
         if self._talker.is_alive():
             self._talker.join(timeout=3.0)
@@ -348,61 +356,65 @@ class BrainService:
             self._consider(text)
 
     def _consider(self, text: str) -> None:
-        """Queue a reply, if there is anybody to reply to."""
+        """Add to what aiRon is being told. Not the same as answering it."""
         if self.conversation is None or self._present is None:
             return
         with self._lock:
-            if self._busy:
-                # Already composing. The VAD ends an utterance on half a second
-                # of silence, which splits one sentence in two far more often
-                # than a person says two separate things that fast, so this
-                # belongs to the turn in progress rather than to a new one.
-                # Answering both is how aiRon said "Ein Lamborghini, in Blau,
-                # nehme ich an?" twice in a row.
-                self._pending.append(text)
-                del self._pending[:-MAX_PENDING]
-                return
-            self._busy = True
-        try:
-            self._jobs.put_nowait(text)
-        except queue.Full:
-            with self._lock:
-                self._busy = False
-            return
+            self._buffer.append(text)
+            del self._buffer[:-MAX_FRAGMENTS]
+            self._heard_at = time.monotonic()
         self._suspend_mirror()
         self._look("thinking")
 
-    def _next_turn(self) -> str | None:
-        """What was said while aiRon was thinking, as one turn, or None.
+    def _still_talking(self) -> bool:
+        """Is there more of this turn still on its way?
 
-        Clearing _busy happens here and only here, under the lock that
-        _consider checks, so there is no gap where an utterance is filed as
-        pending by a talker that has already decided it has nothing to do.
+        Three things say yes, and all three have been seen mid-sentence:
+        the microphone can hear a voice right now; there is captured audio
+        queued that nobody has transcribed; a decode is running.
+
+        That last one is why a timer alone cannot do this. A decode takes
+        one to three seconds, so the second half of a sentence reaches the
+        brain long after the person finished saying it - and any wait short
+        enough to feel conversational would expire before it arrived.
         """
+        if self.ears is not None:
+            if self.ears.hearing_voice or not self.ears.utterances.empty():
+                return True
+        return bool(self.listener is not None and self.listener.decoding)
+
+    def _turn_over(self) -> str | None:
+        """The whole turn as one line, once nobody is still saying it."""
         with self._lock:
-            if not self._pending:
-                self._busy = False
+            if not self._buffer:
                 return None
-            text = " ".join(self._pending)
-            self._pending.clear()
-            return text
+            quiet_for = time.monotonic() - self._heard_at
+        if self._still_talking() or quiet_for < SETTLE_S:
+            return None
+        with self._lock:
+            text = " ".join(self._buffer)
+            self._buffer.clear()
+        return text
 
     def _talk(self) -> None:
-        while not self._stop.is_set():
-            try:
-                text = self._jobs.get(timeout=0.25)
-            except queue.Empty:
-                continue
+        """
+        One turn, one answer.
+
+        The first version of this answered each utterance as it arrived and
+        folded anything heard mid-thought into a follow-up. That produced
+        exactly the thing it was meant to stop: "Ich hab dich gebaut" and "bin
+        sozusagen dein Schöpfer" are one thought, and aiRon thanked him for it
+        twice. The fix is not to answer sooner and merge afterwards - it is to
+        wait until the person has actually finished.
+        """
+        while not self._stop.wait(POLL_S):
+            text = self._turn_over()
             if text is None:
-                break
-            while text is not None:
-                try:
-                    self._reply_to(text)
-                except Exception as exc:      # never strand _busy set
-                    print(f"[brain] reply failed: {str(exc)[:120]}")
-                text = self._next_turn()
-                if text is not None:
-                    self._look("thinking")
+                continue
+            try:
+                self._reply_to(text)
+            except Exception as exc:
+                print(f"[brain] reply failed: {str(exc)[:120]}")
 
     def _reply_to(self, heard: str) -> None:
         person = self._present
