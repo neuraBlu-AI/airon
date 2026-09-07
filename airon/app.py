@@ -175,7 +175,8 @@ def main(argv=None) -> int:
 
     brain = BrainService(bus, speech=speech, vision=vision, face=animator,
                          memory=memory, conversation=conversation, lang=args.lang,
-                         can_listen=listener is not None)
+                         can_listen=listener is not None,
+                         ears=ears, listener=listener)
     brain.start()
 
     def on_camera(event):

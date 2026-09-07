@@ -114,6 +114,11 @@ class Listener:
         self._thread = threading.Thread(target=self._run, name="listener", daemon=True)
         self._stop = threading.Event()
         self.last_text = ""
+        #: True while an utterance is being turned into words. The brain waits
+        #: on this: a decode takes a second or two, so the second half of a
+        #: sentence arrives well after the person stopped saying it, and
+        #: answering before it lands is answering half a question.
+        self.decoding = False
 
     def available(self) -> bool:
         return all((self.model_dir / f).exists() for f in (
@@ -159,15 +164,28 @@ class Listener:
     def _run(self) -> None:
         self._load()
         while not self._stop.is_set():
+            # Flagged busy *before* the utterance leaves the queue, so the
+            # two signals overlap. Taking it first would leave an instant when
+            # the queue is empty and nothing is decoding, and the brain reading
+            # exactly then concludes the person has finished talking - which is
+            # how half a sentence gets answered on its own.
+            if self.audio.utterances.empty():
+                if self._stop.wait(0.05):
+                    break
+                continue
+            self.decoding = True
             try:
-                audio = self.audio.utterances.get(timeout=0.25)
+                audio = self.audio.utterances.get_nowait()
             except Exception:
+                self.decoding = False
                 continue
             try:
                 text = self.transcribe(audio)
             except Exception as exc:
                 print(f"[listener] decode failed: {str(exc)[:120]}")
                 continue
+            finally:
+                self.decoding = False
             if not is_speech(text):
                 continue
             self.last_text = text
