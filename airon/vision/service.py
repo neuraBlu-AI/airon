@@ -3,16 +3,22 @@ vision_service - camera in, structured world state out.
 
 Runs on its own thread at camera rate. It never touches the face renderer or
 the brain directly: it writes a WorldState to the store and publishes events
-on the bus, exactly as spec sections 6-8 require. Face recognition is not here
-yet, so everyone gets a temporary id (spec section 12).
+on the bus, exactly as spec sections 6-8 require.
+
+It also decides who it is looking at. Spec section 12: a face becomes an
+embedding, the embedding is matched against the local gallery, and the person
+keeps a persistent id if they are known - or a temporary guest id if they are
+not, until somebody introduces them.
 """
 
 from __future__ import annotations
 
 import threading
 import time
+from collections import Counter, deque
 
 from ..core import EventBus, EventType, Person, StateStore, WorldState
+from ..identity import FaceRecognizer, Gallery
 from .camera import OakCamera, sample_distance
 from .tracker import FaceTracker
 
@@ -37,18 +43,41 @@ LOOK_EXIT_S = 1.0
 STALL_TIMEOUT_S = 5.0
 RECONNECT_EVERY_S = 5.0
 
+# Identity is decided by vote, not by one lucky frame. A single embedding is a
+# coin flip against a bad blink or a half-turned head; three agreeing samples
+# out of the last five settle it, which at four samples a second means aiRon
+# knows your name inside about a second of seeing your face properly.
+IDENTITY_VOTES = 5
+IDENTITY_AGREE = 3
+
+# How long to keep quiet before admitting we do not know who this is. Someone
+# walking in while looking away can take a couple of seconds to present a face
+# the gate will accept, and announcing a stranger before then is just wrong.
+# Sampling continues afterwards: turn around and aiRon still catches up.
+IDENTITY_TIMEOUT_S = 4.0
+
 
 class VisionService:
     def __init__(self, store: StateStore, bus: EventBus, *,
                  width: int = 640, height: int = 480, fps: int = 30,
                  want_depth: bool = True, force_depth: bool = False,
-                 depth_fps: int | None = None, stream_depth: bool = False):
+                 depth_fps: int | None = None, stream_depth: bool = False,
+                 recognise: bool = True, gallery: Gallery | None = None):
         self.store = store
         self.bus = bus
         self.camera = OakCamera(width, height, fps, want_depth=want_depth,
                                 force_depth=force_depth, depth_fps=depth_fps,
                                 stream_depth=stream_depth)
         self.tracker = FaceTracker()
+
+        self.gallery = gallery if gallery is not None else Gallery()
+        self._want_recognition = recognise
+        self.recognizer = self._make_recognizer()
+
+        self._votes: deque[str | None] = deque(maxlen=IDENTITY_VOTES)
+        self._identified = False
+        self._said_unknown = False
+        self._identify_by = 0.0
 
         self._track_id: int | None = None
         self._person: Person | None = None
@@ -69,6 +98,10 @@ class VisionService:
         self._lock = threading.Lock()
         self._latest = None
         self.fps = 0.0
+
+    def _make_recognizer(self) -> FaceRecognizer | None:
+        return (FaceRecognizer(self.camera)
+                if self._want_recognition and self.camera.has_recognizer else None)
 
     # ------------------------------------------------------------- lifecycle
 
@@ -141,6 +174,7 @@ class VisionService:
             print(f"[vision] reconnect failed: {str(exc)[:90]}")
             return
         self.camera_ok = True
+        self.recognizer = self._make_recognizer()
         print(f"[vision] camera back: {self.camera.name}"
               f"{' with depth' if self.camera.has_depth else ' (no depth)'}")
         self.bus.publish(EventType.CAMERA_READY, depth=self.camera.has_depth)
@@ -158,6 +192,59 @@ class VisionService:
 
         people = [self._person] if self._person is not None else []
         self.store.set(WorldState(people=people, timestamp=time.time()))
+
+    # ------------------------------------------------------------- identity
+
+    def _begin_identification(self, now: float) -> None:
+        """Start over: a new track is a new question, even if it is you again."""
+        self._votes.clear()
+        self._identified = False
+        self._said_unknown = False
+        self._identify_by = now + IDENTITY_TIMEOUT_S
+        if self.recognizer is not None:
+            self.recognizer.reset()
+
+    def _identify(self, person: Person, frame, obs, now: float) -> None:
+        if self.recognizer is None:
+            if not self._said_unknown:
+                self._said_unknown = True
+                self.bus.publish(EventType.UNKNOWN_PERSON_DETECTED, person=person.id)
+            return
+
+        embedding = self.recognizer.update(frame.color, obs.bbox, now)
+        if embedding is not None:
+            match = self.gallery.match(embedding)
+            self._votes.append(match.identity.person_id if match.accepted else None)
+            # Teach the gallery only once the vote has settled, and only about
+            # the person it settled on. One confident-looking sample is exactly
+            # how a gallery gets quietly poisoned with the wrong face.
+            if (self._identified and person.recognized and match.accepted
+                    and match.identity.person_id == person.id):
+                self.gallery.reinforce(match.identity, embedding, match.score)
+
+        if not self._identified:
+            self._decide(person, now)
+
+    def _decide(self, person: Person, now: float) -> None:
+        votes = [v for v in self._votes if v is not None]
+        if votes:
+            winner, agreed = Counter(votes).most_common(1)[0]
+            identity = self.gallery.identities.get(winner)
+            if agreed >= IDENTITY_AGREE and identity is not None:
+                was, person.id = person.id, identity.person_id
+                person.name = identity.name
+                person.recognized = True
+                self._identified = True
+                self.gallery.seen(identity)
+                self.bus.publish(EventType.KNOWN_PERSON_DETECTED,
+                                 person=identity.person_id, name=identity.name, was=was)
+                return
+
+        # Not known yet - say so once, then keep looking. Someone who walks in
+        # facing away should still be greeted by name when they turn round.
+        if not self._said_unknown and now >= self._identify_by:
+            self._said_unknown = True
+            self.bus.publish(EventType.UNKNOWN_PERSON_DETECTED, person=person.id)
 
     def _update_person(self, obs, frame, now: float, present: list) -> None:
         track = None
@@ -186,10 +273,14 @@ class VisionService:
         if self._person is None or self._track_id != track_id:
             if self._person is not None:
                 self.bus.publish(EventType.PERSON_LEFT, person=self._person.id)
-            self._person = Person(id=f"person_{track_id:03d}")
+            # A guest id until the gallery says otherwise (spec section 12).
+            # Keeping the two shapes visibly different - guest_007 against
+            # person_001 - means nothing downstream can mistake a session for
+            # an identity.
+            self._person = Person(id=f"guest_{track_id:03d}")
             self._track_id = track_id
+            self._begin_identification(now)
             self.bus.publish(EventType.PERSON_ENTERED, person=self._person.id)
-            self.bus.publish(EventType.UNKNOWN_PERSON_DETECTED, person=self._person.id)
 
         p = self._person
         p.bbox = obs.bbox
@@ -221,3 +312,9 @@ class VisionService:
                 and now - self._look_false_at >= LOOK_EXIT_S):
             self._was_looking = False
         p.looking_at_airon = self._was_looking
+
+        # Only measure identity off a live detection. A LOST track is the
+        # camera predicting where a face probably went, and embedding that
+        # predicted box means embedding whatever is actually there instead.
+        if measurable:
+            self._identify(p, frame, obs, now)

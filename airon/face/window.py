@@ -75,8 +75,9 @@ class FaceWindow(QWidget):
             lines.append("nobody in view")
         else:
             distance = f"{person.distance_m:.2f} m" if person.distance_m else "no depth"
+            who = f"{person.id} = {person.name}" if person.name else person.id
             lines += [
-                f"{person.id}  {person.position}  {distance}",
+                f"{who}  {person.position}  {distance}",
                 f"attention {person.attention_x:+.2f},{person.attention_y:+.2f}"
                 f"  looking={person.looking_at_airon}",
                 f"eyes {person.eyes_open:.2f}  curve {person.mouth_curve:+.2f}"

@@ -6,8 +6,9 @@ Wiring for Phase 1.
                                    v
                               face_service
 
-brain_service, speech_service and memory_service are not built yet; for now a
-console subscriber stands in for the brain so the event stream is visible.
+brain_service and memory_service are not built yet; for now a console
+subscriber stands in for the brain so the event stream is visible, and a
+greeting handler here does the one thing the brain would obviously do.
 """
 
 from __future__ import annotations
@@ -24,14 +25,11 @@ from .face import FaceAnimator, FaceWindow
 from .speech import SpeechService
 from .vision import VisionService
 
-#: Stand-in for brain_service, which does not exist yet. The cooldown stops
-#: aiRon greeting the same person twice as they settle; it is deliberately
-#: short now that presence tracking no longer treats a glance away as leaving.
-GREET_COOLDOWN_S = 20.0
+#: Stand-in for brain_service, which does not exist yet. Counted per person,
+#: so stepping out of view and back does not restart the conversation. A real
+#: brain will decide this from "have I seen you today", not from a timer.
+GREET_COOLDOWN_S = 120.0
 
-#: --name is a placeholder for face recognition (spec section 12). It greets
-#: whoever appears by that name, which is simply wrong for anyone else - the
-#: point is to prove the milestone's shape until embeddings give real identity.
 GREETINGS = {
     "en": {
         "named": ["Hello {name}, nice to see you.", "Hi {name}, good to see you again."],
@@ -59,8 +57,8 @@ def parse_args(argv=None):
                         help="stereo frame rate (default 10; higher has crashed this device)")
     parser.add_argument("--lang", default="en", choices=["en", "de"],
                         help="default voice language")
-    parser.add_argument("--name", default=None,
-                        help="greet by this name, until face recognition lands")
+    parser.add_argument("--no-recognition", action="store_true",
+                        help="skip face recognition; everyone stays a guest")
     parser.add_argument("--speech-rate", type=float, default=1.05,
                         help="Piper length_scale: 1.0 natural pace, higher is slower")
     parser.add_argument("--no-voice", action="store_true",
@@ -81,13 +79,21 @@ def main(argv=None) -> int:
         vision = VisionService(store, bus, fps=args.fps,
                                want_depth=not args.no_depth,
                                force_depth=args.force_depth,
-                               depth_fps=args.depth_fps)
+                               depth_fps=args.depth_fps,
+                               recognise=not args.no_recognition)
     except Exception as exc:
         print(f"[aiRon] vision failed to start: {exc}", file=sys.stderr)
         return 1
 
     print(f"[aiRon] eyes online: {vision.camera.name}"
           f"{' with depth' if vision.camera.has_depth else ' (no depth)'}")
+    if vision.recognizer is None:
+        print("[aiRon] face recognition off - everyone will be a guest")
+    else:
+        known = vision.gallery.names()
+        print(f"[aiRon] knows {len(known)} "
+              f"{'person' if len(known) == 1 else 'people'}"
+              f"{': ' + ', '.join(known) if known else ' - run tools/enroll_face.py'}")
     vision.start()
 
     speech = None
@@ -104,19 +110,41 @@ def main(argv=None) -> int:
     app = QApplication(sys.argv[:1])
     animator = FaceAnimator(mirror=not args.no_mirror, speech=speech)
 
-    last_greeting = 0.0
+    greeted: dict[str, float] = {}
 
     def on_person(event):
-        """Placeholder for brain_service: say hello to whoever turns up."""
-        nonlocal last_greeting
-        if speech is None or event.type is not EventType.PERSON_ENTERED:
+        """
+        Placeholder for brain_service: say hello to whoever turns up.
+
+        Deliberately driven by the identity events rather than PERSON_ENTERED,
+        so aiRon waits the second it takes to work out who you are and then
+        uses your name, instead of blurting a generic hello at the door.
+        """
+        if speech is None:
             return
+        if event.type is EventType.KNOWN_PERSON_DETECTED:
+            name = event.payload.get("name")
+        elif event.type is EventType.UNKNOWN_PERSON_DETECTED:
+            name = None
+        else:
+            return
+
+        who = event.payload["person"]
         now = time.monotonic()
-        if now - last_greeting < GREET_COOLDOWN_S:
+        if now - greeted.get(who, -1e9) < GREET_COOLDOWN_S:
             return
-        last_greeting = now
-        lines = GREETINGS[args.lang]["named" if args.name else "anon"]
-        speech.say(random.choice(lines).format(name=args.name), lang=args.lang)
+        # Someone greeted as a stranger and only then recognised has already
+        # been said hello to; finding out their name is not a second arrival.
+        was = event.payload.get("was")
+        if was is not None and now - greeted.get(was, -1e9) < GREET_COOLDOWN_S:
+            greeted[who] = greeted[was]
+            return
+
+        greeted[who] = now
+        lines = GREETINGS[args.lang]["named" if name else "anon"]
+        speech.say(random.choice(lines).format(name=name), lang=args.lang)
+        if name is not None and not animator.mirror:
+            animator.command.emotion = "happy"
 
     bus.subscribe(on_person)
 

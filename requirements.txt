@@ -12,3 +12,4 @@ opencv-python>=4.9     # vision service only; the face is Qt
 numpy<2
 PySide6>=6.6           # face renderer, 60 FPS
 piper-tts>=1.8         # local German+English TTS on CPU, no network
+blobconverter>=1.4     # tools/fetch_models.py only, not imported at runtime

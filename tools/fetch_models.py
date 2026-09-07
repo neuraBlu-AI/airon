@@ -11,20 +11,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import blobconverter                                   # noqa: E402
 
-from airon.vision.camera import FACE_BLOB, MODEL_DIR, SHAVES   # noqa: E402
+from airon.vision.camera import (FACE_BLOB, LANDMARK_BLOB, LANDMARK_SHAVES,   # noqa: E402
+                                 MODEL_DIR, REID_BLOB, REID_SHAVES, SHAVES)
+
+#: filename -> (Intel open-model-zoo name, shaves it is compiled for).
+BLOBS = {
+    FACE_BLOB: ("face-detection-retail-0004", SHAVES),
+    LANDMARK_BLOB: ("landmarks-regression-retail-0009", LANDMARK_SHAVES),
+    REID_BLOB: ("face-reidentification-retail-0095", REID_SHAVES),
+}
 
 
 def main() -> int:
     MODEL_DIR.mkdir(exist_ok=True)
-    target = MODEL_DIR / FACE_BLOB
-    if target.exists():
-        print(f"{target} already present")
-        return 0
-    print(f"compiling/downloading face detector for {SHAVES} shaves ...", flush=True)
-    path = blobconverter.from_zoo(name="face-detection-retail-0004",
-                                  shaves=SHAVES, zoo_type="intel")
-    shutil.copy(path, target)
-    print(f"{target}  {target.stat().st_size / 1e6:.1f} MB")
+    for filename, (name, shaves) in BLOBS.items():
+        target = MODEL_DIR / filename
+        if target.exists():
+            print(f"{name}: already present")
+            continue
+        print(f"{name}: compiling/downloading for {shaves} shaves ...", flush=True)
+        path = blobconverter.from_zoo(name=name, shaves=shaves, zoo_type="intel")
+        shutil.copy(path, target)
+        print(f"{name}: {target.stat().st_size / 1e6:.1f} MB")
     return 0
 
 
