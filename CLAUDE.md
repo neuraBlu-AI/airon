@@ -987,3 +987,44 @@ First objectives:
 7. Feed those coordinates into the future RON face renderer.
 
 Do not begin mobility or ROS 2 work until the Phase 1 perception/interaction foundation is working reliably.
+
+---
+
+# 22. Working From Tickets
+
+Work comes from the tracker, not from a conversation.
+
+Tickets live in Plane, in the project **airon** (identifier `AIRON`), reached
+through the MCP server configured in `.mcp.json`. Anything worth doing should
+exist as a ticket before it exists as code.
+
+## Branch Per Ticket
+
+Every ticket gets its own branch, and the branch name carries the ticket
+identifier. That identifier is what lets a branch, a pull request and a ticket
+be matched to each other later without having to ask anybody who wrote what.
+
+Branch naming:
+
+    <TICKET-ID>-<short-kebab-description>
+
+Examples:
+
+    AIRON-2-memory-service
+    AIRON-3-conversational-brain
+    AIRON-7-full-duplex-audio
+
+Rules:
+
+- One ticket, one branch, one pull request.
+- Never commit ticket work directly to `main`.
+- Branch from `main`, unless the ticket genuinely depends on another that has
+  not merged yet - in which case branch from that one and say so in the pull
+  request, so the reviewer knows what to merge first.
+- Name the ticket in the pull request, so the tracker and the repository stay
+  connected from both ends.
+- Move the ticket to the matching state when work starts and when the pull
+  request opens, rather than leaving the board to be reconstructed afterwards.
+
+Work that is not a ticket - a fix to this document, tooling configuration -
+does not need a ticket branch, but still does not go straight to `main`.
