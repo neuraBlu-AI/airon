@@ -24,7 +24,7 @@ RON should eventually be a physically embodied AI companion that can:
 
 The project should be built incrementally, starting with a stationary "brain" prototype and progressively adding mobility, body, arms and autonomous behavior.
 
-Current robot/device name: **Ron**
+Current robot/device name: **aiRon**
 
 ---
 

@@ -1,0 +1,14 @@
+# aiRon Phase 1 - brain / tabletop prototype
+
+# Pinned to DepthAI v2 deliberately. Under depthai 3.10.0 the OAK-D Lite's two
+# OV7251 mono sensors are enumerated and calibrated but deliver no frames at
+# all - verified with GRAY8/RAW8/NV12 requestOutput, with autoCreateCameras
+# stereo, and with the legacy MonoCamera node, on both USB 2 and USB 3 links.
+# The colour sensor streams fine there, so every depth pipeline simply starved.
+# The identical hardware runs stereo at 29.5 fps on 2.33. Re-test v3 on a later
+# release; airon/vision/camera.py still speaks both APIs.
+depthai>=2.33,<3
+opencv-python>=4.9     # vision service only; the face is Qt
+numpy<2
+PySide6>=6.6           # face renderer, 60 FPS
+piper-tts>=1.8         # local German+English TTS on CPU, no network
