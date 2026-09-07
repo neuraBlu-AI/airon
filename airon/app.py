@@ -1,45 +1,31 @@
 """
 Wiring for Phase 1.
 
-    CAMERA -> vision_service -> WorldState + events
-                                   |
-                                   v
-                              face_service
+    CAMERA ---> vision_service ---> WorldState + events ---> brain_service
+                                          |                    |
+    MICS -----> audio_service ---> speech_service (ears)       |
+                                                               v
+                                       face_service  <---  speech_service (voice)
 
-brain_service and memory_service are not built yet; for now a console
-subscriber stands in for the brain so the event stream is visible, and a
-greeting handler here does the one thing the brain would obviously do.
+Every service owns a thread and talks over the bus; nothing here does any
+work of its own beyond deciding what exists. memory_service is the one piece
+of spec section 7 still missing - for now the only thing aiRon remembers
+between runs is who people are, which the identity gallery holds.
 """
 
 from __future__ import annotations
 
 import argparse
-import random
 import sys
-import time
 
 from PySide6.QtWidgets import QApplication
 
+from .audio import AudioService
+from .brain import BrainService
 from .core import EventBus, EventType, StateStore
 from .face import FaceAnimator, FaceWindow
-from .speech import SpeechService
+from .speech import Listener, SpeechService
 from .vision import VisionService
-
-#: Stand-in for brain_service, which does not exist yet. Counted per person,
-#: so stepping out of view and back does not restart the conversation. A real
-#: brain will decide this from "have I seen you today", not from a timer.
-GREET_COOLDOWN_S = 120.0
-
-GREETINGS = {
-    "en": {
-        "named": ["Hello {name}, nice to see you.", "Hi {name}, good to see you again."],
-        "anon": ["Hello there.", "Hi, nice to see you."],
-    },
-    "de": {
-        "named": ["Hallo {name}, schön dich zu sehen.", "Hallo {name}, schön dass du da bist."],
-        "anon": ["Hallo!", "Schön dich zu sehen."],
-    },
-}
 
 
 def parse_args(argv=None):
@@ -63,9 +49,40 @@ def parse_args(argv=None):
                         help="Piper length_scale: 1.0 natural pace, higher is slower")
     parser.add_argument("--no-voice", action="store_true",
                         help="run silently, without speech_service")
+    parser.add_argument("--no-ears", action="store_true",
+                        help="skip the microphone array and speech recognition")
     parser.add_argument("--debug", action="store_true",
                         help="start with the state overlay visible")
     return parser.parse_args(argv)
+
+
+def start_hearing(bus, args, speech):
+    """
+    Bring up the microphone array and speech recognition, if we can.
+
+    Both are optional: aiRon without ears still sees, recognises and speaks,
+    it just cannot ask a stranger who they are. Returning (None, None) is a
+    normal outcome, not an error.
+    """
+    if args.no_ears:
+        return None, None
+
+    # aiRon must not hear itself. The array can cancel its own echo, but only
+    # given the played audio as a reference, and aiRon's voice goes out of the
+    # display's speakers where the array never hears about it.
+    ears = AudioService(bus, is_muted=(lambda: speech.speaking) if speech else None)
+    if not ears.available():
+        print("[aiRon] no voice-activity model - run tools/fetch_speech_models.py")
+        return None, None
+
+    listener = Listener(bus, ears, lang=args.lang)
+    if not listener.available():
+        print("[aiRon] no speech recognition model - run tools/fetch_speech_models.py")
+        return None, None
+
+    ears.start()
+    listener.start()
+    return ears, listener
 
 
 def main(argv=None) -> int:
@@ -107,46 +124,14 @@ def main(argv=None) -> int:
             print("[aiRon] no voices installed - run tools/fetch_voices.py")
             speech = None
 
+    ears, listener = start_hearing(bus, args, speech)
+
     app = QApplication(sys.argv[:1])
     animator = FaceAnimator(mirror=not args.no_mirror, speech=speech)
 
-    greeted: dict[str, float] = {}
-
-    def on_person(event):
-        """
-        Placeholder for brain_service: say hello to whoever turns up.
-
-        Deliberately driven by the identity events rather than PERSON_ENTERED,
-        so aiRon waits the second it takes to work out who you are and then
-        uses your name, instead of blurting a generic hello at the door.
-        """
-        if speech is None:
-            return
-        if event.type is EventType.KNOWN_PERSON_DETECTED:
-            name = event.payload.get("name")
-        elif event.type is EventType.UNKNOWN_PERSON_DETECTED:
-            name = None
-        else:
-            return
-
-        who = event.payload["person"]
-        now = time.monotonic()
-        if now - greeted.get(who, -1e9) < GREET_COOLDOWN_S:
-            return
-        # Someone greeted as a stranger and only then recognised has already
-        # been said hello to; finding out their name is not a second arrival.
-        was = event.payload.get("was")
-        if was is not None and now - greeted.get(was, -1e9) < GREET_COOLDOWN_S:
-            greeted[who] = greeted[was]
-            return
-
-        greeted[who] = now
-        lines = GREETINGS[args.lang]["named" if name else "anon"]
-        speech.say(random.choice(lines).format(name=name), lang=args.lang)
-        if name is not None and not animator.mirror:
-            animator.command.emotion = "happy"
-
-    bus.subscribe(on_person)
+    brain = BrainService(bus, speech=speech, vision=vision, face=animator,
+                         lang=args.lang, can_listen=listener is not None)
+    brain.start()
 
     def on_camera(event):
         """Losing the camera should be visible on aiRon's face, not just in a log."""
@@ -165,6 +150,11 @@ def main(argv=None) -> int:
     try:
         return app.exec()
     finally:
+        brain.stop()
+        if listener is not None:
+            listener.stop()
+        if ears is not None:
+            ears.stop()
         vision.stop()
         if speech is not None:
             speech.stop()

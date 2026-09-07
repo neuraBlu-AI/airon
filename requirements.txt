@@ -13,3 +13,4 @@ numpy<2
 PySide6>=6.6           # face renderer, 60 FPS
 piper-tts>=1.8         # local German+English TTS on CPU, no network
 blobconverter>=1.4     # tools/fetch_models.py only, not imported at runtime
+sherpa-onnx>=1.13      # Silero VAD + Whisper ASR on onnxruntime, no torch

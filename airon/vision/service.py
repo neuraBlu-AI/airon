@@ -17,8 +17,10 @@ import threading
 import time
 from collections import Counter, deque
 
+import numpy as np
+
 from ..core import EventBus, EventType, Person, StateStore, WorldState
-from ..identity import FaceRecognizer, Gallery
+from ..identity import FaceRecognizer, Gallery, Identity
 from .camera import OakCamera, sample_distance
 from .tracker import FaceTracker
 
@@ -56,6 +58,15 @@ IDENTITY_AGREE = 3
 # Sampling continues afterwards: turn around and aiRon still catches up.
 IDENTITY_TIMEOUT_S = 4.0
 
+# Views of the current person, kept in case they introduce themselves. By the
+# time somebody has finished saying "my name is Pierre", aiRon has been
+# quietly collecting gated views of them for several seconds - so enrolment
+# needs no second capture pass and nobody has to hold still for a camera.
+ENROL_BUFFER = 24
+ENROL_MIN_VIEWS = 5
+#: A view that says nothing new is not worth a slot in that buffer.
+ENROL_NOVELTY = 0.97
+
 
 class VisionService:
     def __init__(self, store: StateStore, bus: EventBus, *,
@@ -75,6 +86,8 @@ class VisionService:
         self.recognizer = self._make_recognizer()
 
         self._votes: deque[str | None] = deque(maxlen=IDENTITY_VOTES)
+        self._recent: deque = deque(maxlen=ENROL_BUFFER)
+        self._identity_lock = threading.Lock()
         self._identified = False
         self._said_unknown = False
         self._identify_by = 0.0
@@ -198,6 +211,8 @@ class VisionService:
     def _begin_identification(self, now: float) -> None:
         """Start over: a new track is a new question, even if it is you again."""
         self._votes.clear()
+        with self._identity_lock:
+            self._recent.clear()
         self._identified = False
         self._said_unknown = False
         self._identify_by = now + IDENTITY_TIMEOUT_S
@@ -213,6 +228,7 @@ class VisionService:
 
         embedding = self.recognizer.update(frame.color, obs.bbox, now)
         if embedding is not None:
+            self._remember_view(embedding)
             match = self.gallery.match(embedding)
             self._votes.append(match.identity.person_id if match.accepted else None)
             # Teach the gallery only once the vote has settled, and only about
@@ -224,6 +240,42 @@ class VisionService:
 
         if not self._identified:
             self._decide(person, now)
+
+    def _remember_view(self, embedding) -> None:
+        """Bank a distinct view of whoever is here, for a possible enrolment."""
+        with self._identity_lock:
+            if self._recent and float(np.max(np.stack(self._recent) @ embedding)) > ENROL_NOVELTY:
+                return
+            self._recent.append(embedding)
+
+    def enrol_current(self, name: str) -> Identity | None:
+        """
+        Introduce whoever aiRon is looking at, under `name`.
+
+        Called from the brain's thread while the vision thread keeps running,
+        so the person and the view buffer are taken under a lock and the rest
+        is done outside it. Returns None if nobody is there, or if too few
+        usable views have been gathered to recognise them by later.
+        """
+        with self._identity_lock:
+            views = list(self._recent)
+            person = self._person
+        if person is None or len(views) < ENROL_MIN_VIEWS:
+            return None
+
+        identity = self.gallery.enrol(name, np.stack(views))
+        self.gallery.seen(identity)
+        with self._identity_lock:
+            was = person.id
+            if self._person is person:      # still the same sighting
+                person.id = identity.person_id
+                person.name = identity.name
+                person.recognized = True
+                self._identified = True
+                self._said_unknown = True
+        self.bus.publish(EventType.PERSON_NAMED, person=identity.person_id,
+                         name=identity.name, was=was, views=len(views))
+        return identity
 
     def _decide(self, person: Person, now: float) -> None:
         votes = [v for v in self._votes if v is not None]
