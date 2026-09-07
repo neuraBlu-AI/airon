@@ -53,10 +53,32 @@ WINDOW = 512
 
 #: Utterance shape. A name is short, so speech has to be allowed to be short
 #: too; the silence figure is what decides how long aiRon waits before deciding
-#: you have finished, and half a second is about the pause people leave between
-#: sentences without meaning to hand over.
+#: you have finished.
+#:
+#: Half a second was too little, and it showed up as aiRon losing the end of
+#: sentences: "Was würdest du mir für Schuhe emp", "Was weißt du über",
+#: "aiRon, ich hab eine". Measured by taking five sentences that were actually
+#: cut in a live session, splitting each at the point it broke, and inserting
+#: a real pause - how many of the five came back in one piece rather than two:
+#:
+#:      pause    0.5 s   0.7 s   0.9 s   1.2 s
+#:      0.3 s     4/5     5/5     5/5     5/5
+#:      0.4 s     1/5     4/5     5/5     5/5
+#:      0.5 s     0/5     3/5     5/5     5/5
+#:      0.6 s     0/5     0/5     4/5     5/5
+#:      0.8 s     0/5     0/5     1/5     5/5
+#:
+#: A 0.4 s breath in the middle of a sentence broke four of five at the old
+#: value, and 0.4 s is an ordinary hesitation rather than handing over a turn.
+#: 0.9 s holds a sentence together through the pauses people actually leave
+#: while still treating 0.8 s as finished, which it usually is - past about a
+#: second a person listening would answer too.
+#:
+#: It costs 0.4 s before aiRon starts thinking, on every turn. Worth it: the
+#: alternative is answering half a question, and then answering the other half
+#: separately, which costs a whole exchange.
 MIN_SPEECH_S = 0.25
-MIN_SILENCE_S = 0.5
+MIN_SILENCE_S = 0.9
 MAX_SPEECH_S = 12.0
 
 #: How long after aiRon stops talking before it trusts the microphone again.
