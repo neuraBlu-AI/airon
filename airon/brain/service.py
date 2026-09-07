@@ -37,6 +37,7 @@ import threading
 import time
 
 from ..core import EventBus, EventType
+from ..memory.service import LONG_ABSENCE_S
 from .naming import is_refusal, parse_name
 
 #: Do not greet the same person again for this long. A real brain will decide
@@ -70,6 +71,9 @@ LINES = {
     "en": {
         "greet_known": ["Hello {name}, nice to see you.",
                         "Hi {name}, good to see you again."],
+        "greet_again": ["Hello again, {name}.", "Good to see you back, {name}."],
+        "greet_after_absence": ["{name}! It has been a while.",
+                                "Hello {name}, I have not seen you in a while."],
         "greet_unknown": ["Hello there.", "Hi, nice to see you."],
         "ask_name": ["Hello. I don't think we've met. What's your name?",
                      "Hi. I don't know you yet. What should I call you?"],
@@ -84,6 +88,10 @@ LINES = {
     "de": {
         "greet_known": ["Hallo {name}, schön dich zu sehen.",
                         "Hallo {name}, schön dass du da bist."],
+        "greet_again": ["Hallo {name}, schön dich wiederzusehen.",
+                        "Da bist du ja wieder, {name}."],
+        "greet_after_absence": ["{name}! Lange nicht gesehen.",
+                                "Hallo {name}, wir haben uns lange nicht gesehen."],
         "greet_unknown": ["Hallo!", "Schön dich zu sehen."],
         "ask_name": ["Hallo. Ich glaube wir kennen uns noch nicht. Wie heißt du?",
                      "Hallo. Dich kenne ich noch nicht. Wie soll ich dich nennen?"],
@@ -107,11 +115,12 @@ class BrainService:
     """
 
     def __init__(self, bus: EventBus, *, speech=None, vision=None, face=None,
-                 lang: str = "en", can_listen: bool = False):
+                 memory=None, lang: str = "en", can_listen: bool = False):
         self.bus = bus
         self.speech = speech
         self.vision = vision
         self.face = face
+        self.memory = memory
         self.lang = lang if lang in LINES else "en"
         self.can_listen = can_listen
 
@@ -188,7 +197,24 @@ class BrainService:
             return
         self._mark_greeted(person)
         self._look("happy" if name else "curious")
-        self._say("greet_known" if name else "greet_unknown", name=name)
+        self._say(self._greeting_for(person, name), name=name)
+
+    def _greeting_for(self, person: str, name: str | None) -> str:
+        """
+        Say hello like somebody who remembers you.
+
+        Greeting a regular exactly as you greet a stranger is the tell that a
+        robot is not really keeping track. memory_service already counts the
+        visits and measures the gap; this only has to use them.
+        """
+        if name is None:
+            return "greet_unknown"
+        if self.memory is None:
+            return "greet_known"
+        visits, gap = self.memory.acquaintance(person)
+        if visits <= 1:
+            return "greet_known"
+        return "greet_after_absence" if gap >= LONG_ABSENCE_S else "greet_again"
 
     def _met_a_stranger(self, person: str | None) -> None:
         """Ask who this is, if aiRon can actually hear and remember an answer."""

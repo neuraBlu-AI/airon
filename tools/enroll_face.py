@@ -28,6 +28,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from airon.identity import FaceRecognizer, Gallery     # noqa: E402
+from airon.memory import MemoryStore                   # noqa: E402
 from airon.vision import OakCamera                     # noqa: E402
 
 #: A sample must differ this much from everything already captured to be kept.
@@ -67,11 +68,21 @@ def main(argv=None) -> int:
         return 0
 
     if args.forget:
-        if gallery.forget(args.forget):
-            print(f"aiRon has forgotten {args.forget}.")
-            return 0
-        print(f"aiRon does not know anyone called {args.forget}.", file=sys.stderr)
-        return 1
+        # Face and memories together. "Delete Pierre" has to mean all of
+        # Pierre, or the privacy story the gallery tells is not true.
+        identity = gallery.by_name(args.forget)
+        if identity is None:
+            print(f"aiRon does not know anyone called {args.forget}.", file=sys.stderr)
+            return 1
+        gallery.forget(args.forget)
+        memories = MemoryStore()
+        person = memories.people.get(identity.person_id)
+        remembered = len(person.memories) if person else 0
+        memories.forget_person(identity.person_id)
+        print(f"aiRon has forgotten {args.forget}: "
+              f"{len(identity.vectors)} face views and {remembered} "
+              f"{'memory' if remembered == 1 else 'memories'}.")
+        return 0
 
     if not args.name:
         print("give a name to enrol, or --list / --forget", file=sys.stderr)
