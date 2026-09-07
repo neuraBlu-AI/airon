@@ -70,6 +70,32 @@ MODEL_DIR = Path(__file__).resolve().parent.parent.parent / "models" / "asr"
 #: version of this comparison reached the wrong conclusion.
 WHISPER = "small"
 
+#: Silence appended to every utterance before it is decoded.
+#:
+#: Whisper drops trailing words when the audio stops abruptly, and the VAD
+#: hands over segments with the trailing silence trimmed off, so every
+#: utterance arrived ending on a hard cut. A third of one live session came
+#: back truncated, always at the end, usually mid-word: "Nee, ich bin gerade
+#: am Ar", "Wie heißt die Hauptstadt von Span", "Und was kannst du dich noch
+#: er".
+#:
+#: Sixteen German sentences, trailing silence trimmed the way the VAD trims it,
+#: counting how often the final word failed to survive:
+#:
+#:      padding     last word lost    mean decode
+#:      none            2/16            1.74 s
+#:      0.2 s           1/16            1.80 s
+#:      0.4 s           1/16            1.82 s
+#:      0.6 s           0/16            1.85 s
+#:
+#: One sentence recovering as the padding grows is the whole mechanism:
+#: "mit R" -> "mit Rinder" -> "mit Rinderh" -> "mit Rinderhack".
+#:
+#: sherpa-onnx has its own tail_paddings for this. It recovered nothing here -
+#: still 2/16 - and cost 0.9 s a decode, so the padding is done on the way in
+#: instead, where it is 0.11 s and in units this file controls.
+TAIL_SILENCE_S = 0.6
+
 #: Transcripts that are nothing but a bracketed annotation - "(laughs)",
 #: "[speaking in foreign language]", "*schreit*". All observed from this
 #: microphone within the first minute of use.
@@ -136,9 +162,15 @@ class Listener:
         """One utterance to text. Blocking; called on the listener thread."""
         recognizer = self._load()
         stream = recognizer.create_stream()
-        stream.accept_waveform(16000, audio)
+        stream.accept_waveform(16000, self._with_tail(audio))
         recognizer.decode_stream(stream)
         return stream.result.text.strip()
+
+    @staticmethod
+    def _with_tail(audio: np.ndarray) -> np.ndarray:
+        """The utterance with somewhere to trail off into. See TAIL_SILENCE_S."""
+        tail = np.zeros(int(TAIL_SILENCE_S * 16000), dtype=np.float32)
+        return np.concatenate([np.asarray(audio, dtype=np.float32), tail])
 
     # --------------------------------------------------------------- inner
 
