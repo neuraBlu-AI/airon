@@ -25,6 +25,7 @@ from .brain import BrainService
 from .brain.conversation import Conversation
 from .core import EventBus, EventType, StateStore, load_env
 from .face import FaceAnimator, FaceWindow
+from .face.overlay import build as build_overlays
 from .memory import MemoryService
 from .speech import Listener, SpeechService
 from .vision import VisionService
@@ -59,6 +60,12 @@ def parse_args(argv=None):
                         help="stay scripted; do not use the language model")
     parser.add_argument("--debug", action="store_true",
                         help="start with the state overlay visible")
+    parser.add_argument("--preview", action="store_true",
+                        help="show what the camera sees, small, in the corner (key P)")
+    parser.add_argument("--transcript", action="store_true",
+                        help="show the conversation as text on screen (key T)")
+    parser.add_argument("--inspect", action="store_true",
+                        help="everything useful while testing: --debug --preview --transcript")
     return parser.parse_args(argv)
 
 
@@ -181,8 +188,14 @@ def main(argv=None) -> int:
             animator.mirror = not args.no_mirror
 
     bus.subscribe(on_camera)
-    window = FaceWindow(store, animator, vision=vision, fullscreen=not args.windowed)
-    window.show_debug = args.debug
+    # Test panels only. aiRon behaves identically whether or not they are on;
+    # they are built either way so a key can still reveal one mid-session.
+    overlays = build_overlays(bus, vision,
+                              preview=args.preview or args.inspect,
+                              transcript=args.transcript or args.inspect)
+    window = FaceWindow(store, animator, vision=vision,
+                        fullscreen=not args.windowed, overlays=overlays)
+    window.show_debug = args.debug or args.inspect
     window.setWindowTitle("aiRon")
 
     try:

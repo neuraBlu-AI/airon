@@ -26,12 +26,16 @@ EMOTION_KEYS = list(EMOTIONS)
 
 class FaceWindow(QWidget):
     def __init__(self, store: StateStore, animator: FaceAnimator, vision=None,
-                 fullscreen: bool = True):
+                 fullscreen: bool = True, overlays=None):
         super().__init__()
         self.store = store
         self.animator = animator
         self.vision = vision
         self.show_debug = False
+        # Test panels (airon/face/overlay.py). Anything with `enabled`, `key`
+        # and `paint` belongs here; this class deliberately knows no more than
+        # that, so panels can be added or the lot deleted without touching it.
+        self.overlays = list(overlays or [])
 
         self.setWindowTitle("aiRon")
         self.setAttribute(Qt.WA_OpaquePaintEvent, True)
@@ -62,6 +66,9 @@ class FaceWindow(QWidget):
         paint_face(painter, self.width(), self.height(), self.animator)
         if self.show_debug:
             self._paint_debug(painter)
+        for overlay in self.overlays:
+            if overlay.enabled:
+                overlay.paint(painter, self.width(), self.height())
         painter.end()
 
     def _paint_debug(self, painter: QPainter) -> None:
@@ -91,6 +98,10 @@ class FaceWindow(QWidget):
 
     def keyPressEvent(self, event) -> None:
         key = event.key()
+        for overlay in self.overlays:
+            if key == overlay.key:
+                overlay.enabled = not overlay.enabled
+                return
         if key in (Qt.Key_Q, Qt.Key_Escape):
             self.close()
         elif key == Qt.Key_F:
