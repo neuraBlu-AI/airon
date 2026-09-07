@@ -169,7 +169,16 @@ class VisionService:
         self.camera_ok = False
         self.fps = 0.0
         self._next_retry = time.monotonic() + RECONNECT_EVERY_S
-        print("[vision] camera stopped delivering frames - going blind, will retry")
+        # Ask the device why while it is still there to ask. A stall at 70 C on
+        # a High Speed link and a stall at 50 C on SuperSpeed are different
+        # faults, and once the pipeline is torn down both look like this one
+        # line. Read before close(), because close() takes the answer with it.
+        temp = self.camera.chip_temperature()
+        detail = f"link {self.camera.usb_speed}"
+        if temp is not None:
+            detail += f", chip {temp:.1f}C"
+        print(f"[vision] camera stopped delivering frames ({detail}) "
+              f"- going blind, will retry")
         self.bus.publish(EventType.CAMERA_LOST)
         if self._person is not None:
             self.bus.publish(EventType.PERSON_LEFT, person=self._person.id)

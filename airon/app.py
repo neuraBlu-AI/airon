@@ -115,8 +115,12 @@ def main(argv=None) -> int:
         print(f"[aiRon] vision failed to start: {exc}", file=sys.stderr)
         return 1
 
+    # The link speed is worth saying out loud every time. This OAK-D Lite is
+    # USB 3 hardware that has been seen negotiating HIGH, which is a cable
+    # rather than a setting, and is invisible unless something prints it.
     print(f"[aiRon] eyes online: {vision.camera.name}"
-          f"{' with depth' if vision.camera.has_depth else ' (no depth)'}")
+          f"{' with depth' if vision.camera.has_depth else ' (no depth)'}"
+          f", link {vision.camera.usb_speed}")
     if vision.recognizer is None:
         print("[aiRon] face recognition off - everyone will be a guest")
     else:
