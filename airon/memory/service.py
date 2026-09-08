@@ -221,3 +221,11 @@ class MemoryService:
 
     def forget(self, person_id: str) -> bool:
         return self.store.forget_person(person_id)
+
+    def forget_memory(self, text: str, *, person_id: str | None = None):
+        """Retract one thing, rather than the whole person. A person should be
+        able to take back what they said without ceasing to be known."""
+        memory = self.store.forget_memory(text, person_id=person_id)
+        if memory is not None:
+            self.store.save()
+        return memory

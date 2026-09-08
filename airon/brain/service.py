@@ -39,6 +39,7 @@ import time
 from ..core import EventBus, EventType, log
 from ..memory.service import LONG_ABSENCE_S
 from .naming import is_refusal, parse_name
+from .tools import Toolbox
 
 #: Do not greet the same person again for this long. A real brain will decide
 #: this from "have I seen you today" once memory_service exists.
@@ -134,7 +135,8 @@ class BrainService:
 
     def __init__(self, bus: EventBus, *, speech=None, vision=None, face=None,
                  memory=None, conversation=None, lang: str = "en",
-                 can_listen: bool = False, ears=None, listener=None):
+                 can_listen: bool = False, ears=None, listener=None, store=None,
+                 weather=None):
         self.bus = bus
         self.speech = speech
         self.vision = vision
@@ -147,6 +149,12 @@ class BrainService:
         self.listener = listener
         self.lang = lang if lang in LINES else "en"
         self.can_listen = can_listen
+        # What the model may ask for. Constructed with only the four things it
+        # is allowed to touch - not with self - so that the set of reachable
+        # actions is visible here rather than implied by what a tool happens
+        # to import (AIRON-8). After self.lang, which it needs.
+        self.toolbox = Toolbox(memory=memory, face=face, store=store,
+                               weather=weather, lang=self.lang)
 
         self._lock = threading.Lock()
         self._greeted: dict[str, float] = {}
@@ -464,6 +472,18 @@ class BrainService:
             self._look("curious")
             self._restore_mirror()
             return
+
+        # After the words, deliberately. look_at moves the eyes and the person
+        # should see that while aiRon is still speaking, not instead of being
+        # answered - and a tool that fails must not cost them the reply.
+        if reply.actions:
+            for outcome in self.toolbox.run(reply.actions, person=person):
+                # A tool that fetched a fact says it here, in aiRon's voice
+                # but not in the model's words. The weather is the only one
+                # that does, and it does so precisely because the alternative
+                # is asking a language model what tomorrow will be like.
+                if outcome.speak and self.speech is not None and self._present == person:
+                    self.speech.say(outcome.speak, lang=self.lang)
 
         if not wore:                     # the stream never got as far as a face
             self._look(reply.emotion)

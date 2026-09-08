@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 
 from ..core.log import log
 from ..face.expression import EMOTIONS
+from .tools import TOOLS, Action
 
 #: Opus, because the whole point is that aiRon has a personality rather than
 #: an intent classifier. Cost is per conversation with a person standing in
@@ -101,6 +102,21 @@ Your face:
 - Choose the emotion that fits what you are saying, from this list only:
   {emotions}.
 
+What you can do, besides talk:
+- look_at, when somebody asks you to look at a particular person and there is
+  more than one person in the room. Not otherwise: you already look at whoever
+  is in front of you.
+- remember, when somebody asks you to remember something. This is their
+  request, not your judgement - "remember that I take my tablets at eight".
+- forget, when somebody asks you to forget something they told you.
+- weather, when somebody asks about tomorrow's weather. Put the place they
+  named in the target - "New York" - or leave it empty for where you are.
+  Do not say what the weather will be: you do not know until this has run,
+  and it says the forecast itself. Say only that you are looking, in your
+  own words.
+- Only when asked. Most turns need no action at all, and an empty list is the
+  normal answer. Never announce that you used one; just answer naturally.
+
 What to remember:
 - Record only things that would still matter next week: what somebody tells
   you about themselves, what they like, what they are working on, what they
@@ -129,6 +145,28 @@ REPLY_SCHEMA = {
             "type": "string",
             "description": "What to say out loud. One or two short sentences.",
         },
+        "actions": {
+            "type": "array",
+            "description": ("Things to do as well as say. Usually empty - most "
+                            "turns are only talk. Ask only for what was asked "
+                            "of you; do not act on your own initiative."),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "tool": {"type": "string", "enum": list(TOOLS)},
+                    "target": {
+                        "type": "string",
+                        "description": ("For look_at, whose name. For remember "
+                                        "and forget, the thing itself, in the "
+                                        "third person: 'takes tablets at eight'. "
+                                        "For weather, the place asked about, or "
+                                        "empty for where you are."),
+                    },
+                },
+                "required": ["tool", "target"],
+                "additionalProperties": False,
+            },
+        },
         "remember": {
             "type": "array",
             "description": "Things about this person worth keeping. Usually empty.",
@@ -150,7 +188,11 @@ REPLY_SCHEMA = {
             },
         },
     },
-    "required": ["say", "emotion", "remember"],
+    # actions sits after say in the properties above, deliberately: the reply
+    # is streamed and spoken as it arrives, so anything before `say` delays
+    # the first word. Emotion is one token and earns its place ahead of it;
+    # a list of tool calls does not.
+    "required": ["emotion", "say", "actions", "remember"],
     "additionalProperties": False,
 }
 
@@ -267,6 +309,8 @@ class Reply:
     say: str
     emotion: str = "idle"
     remember: list[dict] = field(default_factory=list)
+    #: What the model asked aiRon to do, as opposed to say. Usually empty.
+    actions: list = field(default_factory=list)
     seconds: float = 0.0
     #: When the first sentence was ready to speak, as opposed to when the
     #: whole reply was. The gap between the two is the point of streaming,
@@ -511,7 +555,10 @@ class Conversation:
         for item in data.get("remember", []):
             if item.get("text"):
                 remember.append({**item, "text": _decoded(str(item["text"]))})
+        actions = [a for a in (Action.from_dict(raw)
+                               for raw in data.get("actions", [])) if a]
         return Reply(
+            actions=actions,
             say=say,
             emotion=emotion if emotion in EMOTIONS else "idle",
             remember=remember,
