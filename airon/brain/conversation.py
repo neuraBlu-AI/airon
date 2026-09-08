@@ -28,6 +28,7 @@ asking a model to emit JSON and hoping is not the same as constraining it to.
 from __future__ import annotations
 
 import json
+import re
 import os
 import time
 from dataclasses import dataclass, field
@@ -123,6 +124,26 @@ REPLY_SCHEMA = {
     "required": ["say", "emotion", "remember"],
     "additionalProperties": False,
 }
+
+
+#: A \uXXXX that survived json.loads, because the model escaped the backslash.
+#: It emitted "hei\\u00dft" rather than "hei\u00dft", so parsing correctly
+#: produced six literal characters, and Piper was asked to pronounce them:
+#: aiRon said "Ja, Max, so hei-backslash-u-null-null-d-f-t du doch" out loud.
+#: Every other German line that session was fine, so the model is inconsistent
+#: about this rather than wrong about it.
+ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+
+def _decoded(text: str) -> str:
+    r"""Turn any surviving \uXXXX back into the character it stands for.
+
+    Deliberately only this form. bytes.decode("unicode_escape") would do the
+    whole job and also corrupt every correctly-decoded umlaut on the way past,
+    being latin-1 underneath. Anything aiRon says aloud is better left alone
+    than rewritten on a guess.
+    """
+    return ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), text)
 
 
 @dataclass
@@ -236,13 +257,17 @@ class Conversation:
             self.last_error = f"unreadable reply: {exc}"
             return None
 
-        say = " ".join(str(data.get("say", "")).split())
+        say = " ".join(_decoded(str(data.get("say", ""))).split())
         if not say:
             return None
         emotion = data.get("emotion", "idle")
+        remember = []
+        for item in data.get("remember", []):
+            if item.get("text"):
+                remember.append({**item, "text": _decoded(str(item["text"]))})
         return Reply(
             say=say,
             emotion=emotion if emotion in EMOTIONS else "idle",
-            remember=[m for m in data.get("remember", []) if m.get("text")],
+            remember=remember,
             seconds=time.monotonic() - started,
         )
