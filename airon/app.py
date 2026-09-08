@@ -167,7 +167,13 @@ def main(argv=None) -> int:
     if not args.no_llm:
         conversation = Conversation(lang=args.lang)
         if conversation.available():
-            log(f"[aiRon] conversation: {conversation.model}")
+            # The whole configuration, not just the model: these are tuning
+            # knobs now, and a recording of aiRon sounding good is only worth
+            # anything if the log says what it was configured with at the time.
+            log(f"[aiRon] conversation: {conversation.model}"
+                  f", effort {conversation.effort}"
+                  f", up to {conversation.max_tokens} tokens"
+                  f", {conversation.timeout_s:g}s to answer")
         else:
             log(f"[aiRon] no conversation - {conversation.last_error}. "
                   "aiRon will still greet people and ask names.")

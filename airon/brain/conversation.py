@@ -41,13 +41,6 @@ from ..face.expression import EMOTIONS
 #: front of a robot, not per API request in a batch job.
 MODEL = "claude-opus-5"
 
-#: Override the above from .env, to try a different model without editing
-#: code. Worth having because the interesting question here - whether a
-#: cheaper model still sounds like aiRon, and how much of the pause before
-#: it speaks is the model - can only be answered by standing in front of
-#: the robot and swapping models between runs.
-MODEL_ENV = "AIRON_LLM_MODEL"
-
 #: A spoken reply is short. This is a ceiling, not a target.
 MAX_TOKENS = 400
 
@@ -57,8 +50,30 @@ MAX_TOKENS = 400
 #: visible text, and the visible text is the thing aiRon says out loud.
 EFFORT = "low"
 
+#: What the API accepts. Which of them a given model accepts is narrower and
+#: model-dependent, so this catches a typo, not an unsupported combination.
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
 #: Past this, the moment has gone and a person is standing there waiting.
 TIMEOUT_S = 12.0
+
+#: All four of the above are overridable from .env, so that a different
+#: configuration can be tried without editing code on the robot. These are
+#: the knobs whose effect is only audible from in front of it: whether a
+#: cheaper model still sounds like aiRon, how much of the pause before it
+#: speaks is thinking, whether a longer ceiling means rambling.
+#:
+#: The timeout is here because it bounds the others rather than because it
+#: is interesting on its own: a reply abandoned on the way back sounds
+#: exactly like a model that had nothing to say, so whatever else is being
+#: tried, this is the number that decides how much of it aiRon ever hears.
+#: It has headroom at present - effort "max" answered a short German prompt
+#: in 5.7 s against the 12 s limit - but that is one measurement on one
+#: link, and not the long context a real conversation accumulates.
+MODEL_ENV = "AIRON_LLM_MODEL"
+EFFORT_ENV = "AIRON_LLM_EFFORT"
+MAX_TOKENS_ENV = "AIRON_LLM_MAX_TOKENS"
+TIMEOUT_ENV = "AIRON_LLM_TIMEOUT"
 
 LANGUAGE_NAMES = {"de": "German", "en": "English"}
 
@@ -161,14 +176,67 @@ class Reply:
     seconds: float = 0.0
 
 
-def configured_model() -> str:
-    """The model to talk through: $AIRON_LLM_MODEL if set, else MODEL.
+def _env(name: str) -> str:
+    """A .env value, with unset, blank and whitespace all reading as unset.
 
-    Unset, blank and whitespace all mean "the default" - a commented-out or
-    half-edited .env line should leave aiRon talking, not send an empty
-    model id to the API and fail every reply with a 404.
+    A commented-out or half-edited line should leave aiRon talking on the
+    defaults, not send an empty model id to the API and fail every reply.
     """
-    return os.environ.get(MODEL_ENV, "").strip() or MODEL
+    return os.environ.get(name, "").strip()
+
+
+def configured_model() -> str:
+    """The model to talk through: $AIRON_LLM_MODEL, else MODEL."""
+    return _env(MODEL_ENV) or MODEL
+
+
+def configured_effort() -> str:
+    """How hard it may think: $AIRON_LLM_EFFORT, else EFFORT.
+
+    A value the API would reject is refused here instead, because the
+    alternative is aiRon coming up looking healthy and then going silent at
+    the first thing anybody says.
+    """
+    value = _env(EFFORT_ENV).lower()
+    if not value:
+        return EFFORT
+    if value not in EFFORTS:
+        log(f"[brain] ignoring {EFFORT_ENV}={value!r}: not one of "
+              f"{', '.join(EFFORTS)} - using {EFFORT}")
+        return EFFORT
+    return value
+
+
+def configured_max_tokens() -> int:
+    """The ceiling on a spoken reply: $AIRON_LLM_MAX_TOKENS, else MAX_TOKENS."""
+    value = _env(MAX_TOKENS_ENV)
+    if not value:
+        return MAX_TOKENS
+    try:
+        tokens = int(value)
+    except ValueError:
+        tokens = 0
+    if tokens < 1:
+        log(f"[brain] ignoring {MAX_TOKENS_ENV}={value!r}: "
+              f"not a positive whole number - using {MAX_TOKENS}")
+        return MAX_TOKENS
+    return tokens
+
+
+def configured_timeout() -> float:
+    """How long to wait for a reply: $AIRON_LLM_TIMEOUT, else TIMEOUT_S."""
+    value = _env(TIMEOUT_ENV)
+    if not value:
+        return TIMEOUT_S
+    try:
+        seconds = float(value)
+    except ValueError:
+        seconds = 0.0
+    if seconds <= 0:
+        log(f"[brain] ignoring {TIMEOUT_ENV}={value!r}: "
+              f"not a positive number of seconds - using {TIMEOUT_S}")
+        return TIMEOUT_S
+    return seconds
 
 
 class Conversation:
@@ -182,14 +250,17 @@ class Conversation:
     """
 
     def __init__(self, *, lang: str = "en", model: str | None = None,
-                 max_tokens: int = MAX_TOKENS, timeout_s: float = TIMEOUT_S):
+                 effort: str | None = None, max_tokens: int | None = None,
+                 timeout_s: float | None = None):
         self.lang = lang if lang in LANGUAGE_NAMES else "en"
-        # Resolved here rather than as a default argument: a default is bound
+        # Resolved here rather than as default arguments: a default is bound
         # when this module is imported, which happens before app.main() reads
         # the .env, so an env-derived default would always be the stale one.
+        # An argument still wins over .env, for callers that pin one.
         self.model = model or configured_model()
-        self.max_tokens = max_tokens
-        self.timeout_s = timeout_s
+        self.effort = effort or configured_effort()
+        self.max_tokens = max_tokens or configured_max_tokens()
+        self.timeout_s = timeout_s or configured_timeout()
         self._client = None
         self.last_error = ""
 
@@ -258,7 +329,7 @@ class Conversation:
                 system=self.system(context or "Somebody aiRon has not met before."),
                 messages=messages,
                 output_config={
-                    "effort": EFFORT,
+                    "effort": self.effort,
                     "format": {"type": "json_schema", "schema": REPLY_SCHEMA},
                 },
             )
