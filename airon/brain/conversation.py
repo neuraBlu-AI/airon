@@ -112,15 +112,22 @@ What to remember:
 
 REPLY_SCHEMA = {
     "type": "object",
+    # Order matters now that the reply is streamed and spoken as it arrives:
+    # a field cannot be used before it has been generated. Emotion is one
+    # short token and comes first so the face is already right when the first
+    # word is spoken - the alternative, learned by watching it, is aiRon
+    # delivering a whole happy sentence wearing its thinking face and
+    # changing expression just as it stops talking. The cost is that the
+    # model commits to a face before writing the words rather than after.
     "properties": {
-        "say": {
-            "type": "string",
-            "description": "What to say out loud. One or two short sentences.",
-        },
         "emotion": {
             "type": "string",
             "enum": sorted(EMOTIONS),
             "description": "The face to wear while saying it.",
+        },
+        "say": {
+            "type": "string",
+            "description": "What to say out loud. One or two short sentences.",
         },
         "remember": {
             "type": "array",
@@ -168,12 +175,103 @@ def _decoded(text: str) -> str:
     return ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), text)
 
 
+#: End of something worth speaking: terminal punctuation, then whitespace,
+#: then a capital. All three are needed. Without the whitespace "3.5" is two
+#: sentences; without the capital so is "z.B." - and a sentence split down
+#: the middle is not a pause, it is a stutter, because Piper synthesises each
+#: piece separately and puts a breath between them.
+SENTENCE_END = re.compile(r"[.!?…]['\")\]]*\s+(?=[A-ZÄÖÜ\"'])")
+
+#: A JSON escape that has only half arrived. "\" could still become "\n",
+#: and "\u00" could still become "\u00e4" - decoding either now is wrong.
+HALF_ESCAPE = re.compile(r"(?<!\\)\\(?:u[0-9a-fA-F]{0,3})?$")
+
+
+def _partial_string(raw: str, key: str, *, whole: bool = False) -> str | None:
+    """The value of a top-level string key in JSON that is still arriving.
+
+    None until the key and its opening quote exist; after that, as much of
+    the value as has been decoded, growing on each call. With `whole`, None
+    until the closing quote has arrived too - which is what anything picking
+    one of a fixed set of values needs, because "happ" is not an emotion and
+    a moment later it was going to be "happy".
+    """
+    opening = re.search(rf'"{key}"\s*:\s*"', raw)
+    if opening is None:
+        return None
+    start = opening.end()
+    at, closed = start, False
+    while at < len(raw):
+        if raw[at] == "\\":
+            at += 2
+            continue
+        if raw[at] == '"':
+            closed = True
+            break
+        at += 1
+    if whole and not closed:
+        return None
+
+    fragment = HALF_ESCAPE.sub("", raw[start:at])
+    try:
+        return json.loads(f'"{fragment}"')
+    except json.JSONDecodeError:
+        return None
+
+
+class _Spoken:
+    """Whole sentences, pulled out of a reply while it is still being written.
+
+    The reply arrives as JSON, so there is no getting a field early without
+    reading a half-finished document. That is the whole job here: hand back
+    each sentence of `say` the moment it is complete, and the emotion as soon
+    as it exists, rather than waiting for the closing brace.
+    """
+
+    def __init__(self):
+        self.raw = ""
+        self.say = ""
+        self.emotion = ""
+        self._spoken = 0
+
+    def feed(self, delta: str) -> list[str]:
+        """Take the next piece of the document; return any finished sentences."""
+        self.raw += delta
+        if not self.emotion:
+            self.emotion = _partial_string(self.raw, "emotion", whole=True) or ""
+        value = _partial_string(self.raw, "say")
+        if value is not None:
+            self.say = value
+
+        finished = []
+        while (match := SENTENCE_END.search(self.say, self._spoken)) is not None:
+            finished.append(self.say[self._spoken:match.end()])
+            self._spoken = match.end()
+        return [tidy for s in finished if (tidy := _tidy(s))]
+
+    def rest(self) -> str:
+        """Whatever is left when the document ends: the last sentence, which
+        has no whitespace after it to be recognised by."""
+        tail = _tidy(self.say[self._spoken:])
+        self._spoken = len(self.say)
+        return tail
+
+
+def _tidy(text: str) -> str:
+    """One spoken line: escapes decoded, whitespace collapsed."""
+    return " ".join(_decoded(text).split())
+
+
 @dataclass
 class Reply:
     say: str
     emotion: str = "idle"
     remember: list[dict] = field(default_factory=list)
     seconds: float = 0.0
+    #: When the first sentence was ready to speak, as opposed to when the
+    #: whole reply was. The gap between the two is the point of streaming,
+    #: and AIRON-12 asks for it measured rather than felt.
+    first_words: float = 0.0
 
 
 def _env(name: str) -> str:
@@ -302,8 +400,22 @@ class Conversation:
         ]
 
     def reply(self, heard: str, *, context: str = "",
-              history: list[tuple[str, str]] | None = None) -> Reply | None:
-        """One turn. Blocking, so call it off any thread that matters."""
+              history: list[tuple[str, str]] | None = None,
+              on_emotion=None, on_sentence=None) -> Reply | None:
+        """One turn. Blocking, so call it off any thread that matters.
+
+        The reply is streamed whether or not anybody is listening for the
+        pieces, because the pieces are the point: `on_sentence` is called
+        with each sentence as it finishes, seconds before the reply is done,
+        and `on_emotion` once as soon as the face is known. Return False from
+        `on_sentence` to stop speaking - the stream is still read to the end,
+        because what the model wanted remembered arrives after the words and
+        is worth having even when the words were not said.
+
+        The Reply that comes back is the whole thing, from the finished
+        document rather than the running parse, so callers that only want the
+        answer can carry on ignoring both callbacks.
+        """
         if not heard.strip():
             return None
 
@@ -322,8 +434,21 @@ class Conversation:
             messages.insert(0, {"role": "user", "content": "(they are here)"})
 
         started = time.monotonic()
+        spoken = _Spoken()
+        first_words = 0.0
+        keep_speaking = True
+
+        def offer(sentence: str) -> None:
+            """Hand one finished sentence to the caller, if it still wants them."""
+            nonlocal first_words, keep_speaking
+            if on_sentence is None or not keep_speaking or not sentence:
+                return
+            if not first_words:
+                first_words = time.monotonic() - started
+            keep_speaking = on_sentence(sentence) is not False
+
         try:
-            response = self._load().messages.create(
+            with self._load().messages.stream(
                 model=self.model,
                 max_tokens=self.max_tokens,
                 system=self.system(context or "Somebody aiRon has not met before."),
@@ -332,11 +457,34 @@ class Conversation:
                     "effort": self.effort,
                     "format": {"type": "json_schema", "schema": REPLY_SCHEMA},
                 },
-            )
+            ) as stream:
+                told = False
+                for delta in stream.text_stream:
+                    ready = spoken.feed(delta)
+                    # Before the sentences, not with them: the emotion is the
+                    # first field in the document precisely so the face can
+                    # change before the mouth opens.
+                    if not told and spoken.emotion in EMOTIONS:
+                        told = True
+                        if on_emotion is not None:
+                            on_emotion(spoken.emotion)
+                    for sentence in ready:
+                        offer(sentence)
+                offer(spoken.rest())
+                response = stream.get_final_message()
         except Exception as exc:                    # network, auth, rate limit
             self.last_error = f"{type(exc).__name__}: {str(exc)[:160]}"
             log(f"[brain] model call failed: {self.last_error}")
-            return None
+            # Not necessarily nothing. A stream that dies late has already put
+            # words in the air, and returning None would have the brain treat
+            # a spoken turn as one that never happened - no memory of it, no
+            # history entry, and aiRon repeating itself when asked again.
+            if not first_words:
+                return None
+            return Reply(say=_tidy(spoken.say),
+                         emotion=spoken.emotion if spoken.emotion in EMOTIONS else "idle",
+                         seconds=time.monotonic() - started,
+                         first_words=first_words)
 
         if response.stop_reason == "refusal":
             self.last_error = "refused"
@@ -361,4 +509,5 @@ class Conversation:
             emotion=emotion if emotion in EMOTIONS else "idle",
             remember=remember,
             seconds=time.monotonic() - started,
+            first_words=first_words or (time.monotonic() - started),
         )

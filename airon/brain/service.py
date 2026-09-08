@@ -421,7 +421,43 @@ class BrainService:
         context = self.memory.context_for(person) if self.memory else ""
         history = self.memory.conversation() if self.memory else []
 
-        reply = self.conversation.reply(heard, context=context, history=history)
+        said: list[str] = []
+        wore: list[str] = []
+
+        def wear(emotion: str) -> None:
+            """The face, as soon as the model has chosen one - which is before
+            it has finished choosing the words."""
+            wore.append(emotion)
+            self._look(emotion)
+
+        def speak(sentence: str) -> bool:
+            """One finished sentence, while the rest is still being written.
+
+            Composed for whoever was there when they spoke. Seconds later that
+            may not be who is standing here now - and the reply is built around
+            their name and what aiRon remembers about them. Said to the wrong
+            person it is not merely stale, it is wrong about who they are:
+            André was told "Ja, Max, so heißt du doch" because Max had asked
+            the question and left while the answer was being written.
+
+            So it is abandoned rather than redirected. It cannot be rewritten
+            for somebody else without asking the model again, and saying
+            nothing to a person aiRon has not answered is a much smaller
+            failure than calling them by another person's name. Checking here,
+            per sentence, is what streaming buys: the turn can be cut off the
+            moment the room changes instead of being judged once at the end.
+            """
+            if self._present != person:
+                log(f"[brain] stopped mid-reply - it was for "
+                    f"{person or 'nobody'}, and {self._present or 'nobody'} is here now")
+                return False
+            if self.speech is not None:
+                self.speech.say(sentence, lang=self.lang)
+            said.append(sentence)
+            return True
+
+        reply = self.conversation.reply(heard, context=context, history=history,
+                                        on_emotion=wear, on_sentence=speak)
         if reply is None:
             # Nothing to say beats saying something wrong. The face drops the
             # thinking look so it does not sit there pretending.
@@ -429,28 +465,14 @@ class BrainService:
             self._restore_mirror()
             return
 
-        # Composed for whoever was there when they spoke. Six to nine seconds
-        # later, that may not be who is standing here now - and the reply is
-        # built around their name and what aiRon remembers about them. Said to
-        # the wrong person it is not merely stale, it is wrong about who they
-        # are: André was told "Ja, Max, so heißt du doch" because Max had asked
-        # the question and left while the answer was being written.
-        #
-        # So it is dropped rather than redirected. It cannot be rewritten for
-        # somebody else without asking the model again, and saying nothing to a
-        # person aiRon has not answered is a much smaller failure than calling
-        # them by another person's name.
-        if self._present != person:
-            log(f"[brain] not saying that - it was for "
-                f"{person or 'nobody'}, and {self._present or 'nobody'} is here now")
+        if not wore:                     # the stream never got as far as a face
+            self._look(reply.emotion)
+        if not said:
             self._look("curious")
             self._restore_mirror()
-            self._remember(reply, person)
-            return
-
-        self._look(reply.emotion)
-        if self.speech is not None:
-            self.speech.say(reply.say, lang=self.lang)
+        else:
+            log(f"[brain] first words in {reply.first_words:.1f}s, "
+                f"whole reply in {reply.seconds:.1f}s")
 
         self._remember(reply, person)
 
