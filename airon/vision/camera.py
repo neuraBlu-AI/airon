@@ -388,6 +388,12 @@ class OakCamera:
             self.usb_speed = str(device.getUsbSpeed()).split(".")[-1]
         except Exception:
             pass
+        # Read here rather than trusting lsusb: idle the OAK enumerates as USB
+        # 2, and only negotiates SuperSpeed once a pipeline is actually running,
+        # so this is the first moment the answer is the true one. Said on every
+        # build, which includes each reconnect - a camera that comes back at
+        # HIGH after a stall is a different machine to the one that left.
+        log(f"[vision] OAK link speed: {self.usb_speed}")
 
     def chip_temperature(self) -> float | None:
         """Average die temperature in C, or None if the device cannot be asked.
