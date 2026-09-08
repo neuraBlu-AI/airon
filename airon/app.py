@@ -61,6 +61,9 @@ def parse_args(argv=None):
                         help="do not remember anything between runs")
     parser.add_argument("--no-llm", action="store_true",
                         help="stay scripted; do not use the language model")
+    parser.add_argument("--brain", default="cloud", choices=["cloud", "local"],
+                        help="where the conversation is thought: the Anthropic API, "
+                             "or a model on this robot's own GPU (AIRON-9)")
     parser.add_argument("--debug", action="store_true",
                         help="start with the state overlay visible")
     parser.add_argument("--preview", action="store_true",
@@ -167,15 +170,21 @@ def main(argv=None) -> int:
 
     conversation = None
     if not args.no_llm:
-        conversation = Conversation(lang=args.lang)
+        if args.brain == "local":
+            from .brain.local import LocalConversation
+            conversation = LocalConversation(lang=args.lang)
+        else:
+            conversation = Conversation(lang=args.lang)
         if conversation.available():
             # The whole configuration, not just the model: these are tuning
             # knobs now, and a recording of aiRon sounding good is only worth
             # anything if the log says what it was configured with at the time.
-            log(f"[aiRon] conversation: {conversation.model}"
-                  f", effort {conversation.effort}"
-                  f", up to {conversation.max_tokens} tokens"
-                  f", {conversation.timeout_s:g}s to answer")
+            log(f"[aiRon] conversation: {conversation.summary}")
+            if args.brain == "local":
+                # Half a minute of weights, paid now rather than by whoever
+                # happens to say hello first.
+                log("[aiRon] warming the local brain ...")
+                log(f"[aiRon] local brain ready in {conversation.warm():.1f}s")
         else:
             log(f"[aiRon] no conversation - {conversation.last_error}. "
                   "aiRon will still greet people and ask names.")

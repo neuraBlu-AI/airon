@@ -212,8 +212,28 @@ class _WhisperCpp:
         import sysconfig
 
         lib = Path(sysconfig.get_paths()["purelib"])
-        for pattern in ("libggml-base.so.0", "libggml-cpu.so",
-                        "libggml-cuda.so.0", "libggml.so.0", "libwhisper.so.1"):
+
+        # whisper.cpp and llama.cpp each vendor a libggml.so.0 - same soname,
+        # different versions - and a process gets exactly one of them. Whoever
+        # loads first wins, and llama.cpp's is the newer superset: load that
+        # one first and whisper binds to it happily, measurably as fast. The
+        # other way round, llama.cpp cannot find symbols its own ggml has and
+        # whisper's does not, and dies on import with "undefined symbol:
+        # ggml_dsv4_hc_post" - which, since the listener starts before the
+        # brain, is what happens by default.
+        #
+        # So if the local brain is installed at all, its ggml goes in first,
+        # whether or not this run is using it. Costs a CUDA context; buys an
+        # aiRon that starts.
+        libraries = ("libggml-base.so.0", "libggml-cpu.so", "libggml-cuda.so.0",
+                     "libggml.so.0", "libwhisper.so.1")
+        try:
+            import llama_cpp                                   # noqa: F401
+            libraries = ("libwhisper.so.1",)
+        except ImportError:
+            pass
+
+        for pattern in libraries:
             for path in sorted(lib.glob(pattern)):
                 try:
                     ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
