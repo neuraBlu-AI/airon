@@ -135,7 +135,6 @@ def main(argv=None) -> int:
         log(f"[aiRon] knows {len(known)} "
               f"{'person' if len(known) == 1 else 'people'}"
               f"{': ' + ', '.join(known) if known else ' - run tools/enroll_face.py'}")
-    vision.start()
 
     speech = None
     if not args.no_voice:
@@ -200,6 +199,25 @@ def main(argv=None) -> int:
     overlays = build_overlays(bus, vision,
                               preview=args.preview or args.inspect,
                               transcript=args.transcript or args.inspect)
+
+    # Only now, once everything that listens has been built. Vision publishes
+    # PERSON_ENTERED and KNOWN_PERSON_DETECTED the instant it sees a face, and
+    # an event published before its subscribers exist is not delivered late,
+    # it is not delivered at all.
+    #
+    # Somebody already standing in front of the robot when it was switched on -
+    # which is how one switches on a robot - was recognised in under five
+    # seconds, before the brain had been constructed. The brain learns who is
+    # in the room only from those events, and a person who stays in frame never
+    # arrives a second time, so it spent the whole session believing the room
+    # was empty: hearing every word, transcribing it correctly, and dropping
+    # all of it in silence. Being a race, it came and went with how fast
+    # whisper happened to load that morning, which is what made one bug look
+    # like several.
+    #
+    # This is the last line of the setup for that reason. Anything added below
+    # it that subscribes to the bus is a subscriber that can miss an arrival.
+    vision.start()
     window = FaceWindow(store, animator, vision=vision,
                         fullscreen=not args.windowed, overlays=overlays)
     window.show_debug = args.debug or args.inspect
