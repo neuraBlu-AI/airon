@@ -26,13 +26,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from airon.audio import AudioService, find_capture_device   # noqa: E402
 from airon.brain.naming import is_refusal, parse_name       # noqa: E402
 from airon.core import EventBus, EventType                  # noqa: E402
-from airon.speech import Listener                           # noqa: E402
+from airon.speech import ENGINES, Listener                           # noqa: E402
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="hearing_bench")
     parser.add_argument("--lang", default="en", choices=["en", "de"])
     parser.add_argument("--device", default=None, help="ALSA capture device")
+    parser.add_argument("--asr", default="auto", choices=list(ENGINES),
+                        help="which recognition engine to listen with")
     args = parser.parse_args(argv)
 
     bus = EventBus()
@@ -54,7 +56,7 @@ def main(argv=None) -> int:
     if not ears.available():
         print("no voice-activity model - run tools/fetch_speech_models.py", file=sys.stderr)
         return 1
-    listener = Listener(bus, ears, lang=args.lang)
+    listener = Listener(bus, ears, lang=args.lang, engine=args.asr)
     if not listener.available():
         print("no speech recognition model - run tools/fetch_speech_models.py",
               file=sys.stderr)

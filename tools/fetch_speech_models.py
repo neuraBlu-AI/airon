@@ -12,9 +12,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from airon.audio.service import MODEL_DIR, VAD_MODEL        # noqa: E402
-from airon.speech.listener import WHISPER                   # noqa: E402
+from airon.speech.listener import GGML_DIR, WHISPER         # noqa: E402
 
 RELEASES = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models"
+
+#: The same Whisper weights in ggml form, for the engine that runs on the GPU.
+GGML = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
 
 
 def download(url: str, target: Path) -> None:
@@ -36,9 +39,21 @@ def main() -> int:
         print("silero VAD:")
         download(f"{RELEASES}/silero_vad.onnx", VAD_MODEL)
 
+    # Both engines run the same weights in different formats, and which one
+    # aiRon uses depends on whether whisper.cpp was built against CUDA. Fetch
+    # both: together they are under a gigabyte, and a robot that will not
+    # listen because the wrong format is on disk is a bad trade for the space.
+    GGML_DIR.mkdir(parents=True, exist_ok=True)
+    ggml = GGML_DIR / f"ggml-{WHISPER}.bin"
+    if ggml.exists():
+        print(f"whisper-{WHISPER} (ggml, for the GPU): already present")
+    else:
+        print(f"whisper-{WHISPER} (ggml, for the GPU):")
+        download(f"{GGML}/ggml-{WHISPER}.bin", ggml)
+
     whisper_dir = MODEL_DIR / f"sherpa-onnx-whisper-{WHISPER}"
     if whisper_dir.exists():
-        print(f"whisper-{WHISPER}: already present")
+        print(f"whisper-{WHISPER} (onnx, for the CPU): already present")
         return 0
 
     # The archive carries fp32 and int8 side by side; aiRon runs the int8

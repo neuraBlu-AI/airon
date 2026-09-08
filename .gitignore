@@ -8,3 +8,5 @@ models/
 known_faces/
 memories/
 .env
+# locally built wheels, e.g. pywhispercpp compiled against CUDA
+wheelhouse/

@@ -13,5 +13,21 @@ numpy<2
 PySide6>=6.6           # face renderer, 60 FPS
 piper-tts>=1.8         # local German+English TTS on CPU, no network
 blobconverter>=1.4     # tools/fetch_models.py only, not imported at runtime
-sherpa-onnx>=1.13      # Silero VAD + Whisper ASR on onnxruntime, no torch
+sherpa-onnx>=1.13      # Silero VAD, and Whisper on the CPU as the fallback
+
+# Whisper on the Jetson's GPU - eight times faster than the CPU engine above
+# and more accurate with it, because the GPU can afford fp16 where the CPU
+# needed int8. Deliberately not installed by this file: there is no wheel for
+# JetPack 7 / sm_87, so it has to be compiled against the local CUDA, which
+# takes about twenty minutes and needs the toolkit present:
+#
+#     sudo apt-get install cuda-toolkit-13-2 libcudnn9-cuda-13
+#     PATH=/usr/local/cuda/bin:$PATH CMAKE_BUILD_PARALLEL_LEVEL=4 \
+#     CMAKE_ARGS="-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=87" \
+#     pip install --no-binary pywhispercpp pywhispercpp
+#
+# Without it aiRon still hears, on sherpa-onnx, slowly. Do not add the PyPI
+# onnxruntime-gpu wheel instead: it loads and then dies on the first kernel,
+# CUDA failure 209, because it carries no sm_87 code.
+# pywhispercpp>=1.5
 anthropic>=1.4         # brain_service; optional - aiRon stays scripted without a key

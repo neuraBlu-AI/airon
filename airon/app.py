@@ -27,7 +27,7 @@ from .core import EventBus, EventType, StateStore, load_env, log
 from .face import FaceAnimator, FaceWindow
 from .face.overlay import build as build_overlays
 from .memory import MemoryService
-from .speech import Listener, SpeechService
+from .speech import ENGINES, Listener, SpeechService
 from .vision import VisionService
 
 
@@ -54,6 +54,9 @@ def parse_args(argv=None):
                         help="run silently, without speech_service")
     parser.add_argument("--no-ears", action="store_true",
                         help="skip the microphone array and speech recognition")
+    parser.add_argument("--asr", default="auto", choices=list(ENGINES),
+                        help="speech recognition engine: whisper.cpp on the GPU, "
+                             "sherpa-onnx on the CPU, or whichever is installed")
     parser.add_argument("--no-memory", action="store_true",
                         help="do not remember anything between runs")
     parser.add_argument("--no-llm", action="store_true",
@@ -88,7 +91,7 @@ def start_hearing(bus, args, speech):
         log("[aiRon] no voice-activity model - run tools/fetch_speech_models.py")
         return None, None
 
-    listener = Listener(bus, ears, lang=args.lang)
+    listener = Listener(bus, ears, lang=args.lang, engine=args.asr)
     if not listener.available():
         log("[aiRon] no speech recognition model - run tools/fetch_speech_models.py")
         return None, None
