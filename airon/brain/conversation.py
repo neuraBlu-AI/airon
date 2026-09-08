@@ -41,6 +41,13 @@ from ..face.expression import EMOTIONS
 #: front of a robot, not per API request in a batch job.
 MODEL = "claude-opus-5"
 
+#: Override the above from .env, to try a different model without editing
+#: code. Worth having because the interesting question here - whether a
+#: cheaper model still sounds like aiRon, and how much of the pause before
+#: it speaks is the model - can only be answered by standing in front of
+#: the robot and swapping models between runs.
+MODEL_ENV = "AIRON_LLM_MODEL"
+
 #: A spoken reply is short. This is a ceiling, not a target.
 MAX_TOKENS = 400
 
@@ -154,6 +161,16 @@ class Reply:
     seconds: float = 0.0
 
 
+def configured_model() -> str:
+    """The model to talk through: $AIRON_LLM_MODEL if set, else MODEL.
+
+    Unset, blank and whitespace all mean "the default" - a commented-out or
+    half-edited .env line should leave aiRon talking, not send an empty
+    model id to the API and fail every reply with a 404.
+    """
+    return os.environ.get(MODEL_ENV, "").strip() or MODEL
+
+
 class Conversation:
     """
     A thin, failable wrapper around the model.
@@ -164,10 +181,13 @@ class Conversation:
     traceback in the middle of a conversation is not.
     """
 
-    def __init__(self, *, lang: str = "en", model: str = MODEL,
+    def __init__(self, *, lang: str = "en", model: str | None = None,
                  max_tokens: int = MAX_TOKENS, timeout_s: float = TIMEOUT_S):
         self.lang = lang if lang in LANGUAGE_NAMES else "en"
-        self.model = model
+        # Resolved here rather than as a default argument: a default is bound
+        # when this module is imported, which happens before app.main() reads
+        # the .env, so an env-derived default would always be the stale one.
+        self.model = model or configured_model()
         self.max_tokens = max_tokens
         self.timeout_s = timeout_s
         self._client = None
