@@ -362,6 +362,13 @@ class Conversation:
         self._client = None
         self.last_error = ""
 
+    @property
+    def summary(self) -> str:
+        """What this brain is, for the startup log. LocalConversation has one
+        too, so the line reads sensibly whichever is in use."""
+        return (f"{self.model}, effort {self.effort}, "
+                f"up to {self.max_tokens} tokens, {self.timeout_s:g}s to answer")
+
     def available(self) -> bool:
         """Whether there is any point trying. Checked before the brain wires
         the model in, so aiRon degrades to its scripted self rather than
