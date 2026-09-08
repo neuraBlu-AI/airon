@@ -39,6 +39,10 @@ from ..core import EventBus, EventType, log
 
 MODEL_DIR = Path(__file__).resolve().parent.parent.parent / "models" / "asr"
 
+#: Where the ggml build of the same Whisper weights lives, for the engine that
+#: can use the Jetson's GPU. Fetched by tools/fetch_speech_models.py.
+GGML_DIR = MODEL_DIR / "whispercpp"
+
 #: Multilingual, so German and English both work without swapping models.
 #: Change this and re-run tools/fetch_speech_models.py.
 #:
@@ -96,6 +100,27 @@ WHISPER = "small"
 #: instead, where it is 0.11 s and in units this file controls.
 TAIL_SILENCE_S = 0.6
 
+#: Which engine turns audio into words.
+#:
+#: Both run the same Whisper weights and differ in where the arithmetic
+#: happens. Measured here on one 3.89 s German utterance, five decodes:
+#:
+#:      engine                          median    transcript
+#:      sherpa-onnx, int8, 4 CPU cores    3.57 s   "Kommt morgen, Ironen, ...
+#:                                                  über Marx erzählt habe?"
+#:      whisper.cpp, fp16, CUDA sm_87     0.44 s   "Guten Morgen, Iron, ...
+#:                                                  über Max erzählt habe?"
+#:
+#: Eight times faster and more accurate, which is not the usual trade. The
+#: accuracy comes from the same place as the speed: the CPU engine runs int8
+#: weights because anything larger was too slow, and the GPU can afford fp16.
+#: Marx was André's son Max.
+#:
+#: The CPU engine stays as the fallback rather than as a rival. A machine
+#: without CUDA - a laptop, a fresh clone, a Jetson before JetPack is
+#: installed - still hears, just slowly.
+ENGINES = ("auto", "whispercpp", "sherpa")
+
 #: Transcripts that are nothing but a bracketed annotation - "(laughs)",
 #: "[speaking in foreign language]", "*schreit*". All observed from this
 #: microphone within the first minute of use.
@@ -120,6 +145,95 @@ def is_speech(text: str) -> bool:
     return bool(bare) and bare not in FILLER
 
 
+class _Sherpa:
+    """Whisper on the CPU, through sherpa-onnx. The fallback engine."""
+
+    name = "sherpa-onnx"
+
+    def __init__(self, model_dir: Path, lang: str, threads: int):
+        self.model_dir, self.lang, self.threads = model_dir, lang, threads
+        self._recognizer = None
+
+    def available(self) -> bool:
+        return all((self.model_dir / f).exists() for f in (
+            f"{WHISPER}-encoder.int8.onnx", f"{WHISPER}-decoder.int8.onnx",
+            f"{WHISPER}-tokens.txt"))
+
+    def load(self) -> None:
+        import sherpa_onnx
+
+        self._recognizer = sherpa_onnx.OfflineRecognizer.from_whisper(
+            encoder=str(self.model_dir / f"{WHISPER}-encoder.int8.onnx"),
+            decoder=str(self.model_dir / f"{WHISPER}-decoder.int8.onnx"),
+            tokens=str(self.model_dir / f"{WHISPER}-tokens.txt"),
+            num_threads=self.threads, language=self.lang, task="transcribe")
+
+    def transcribe(self, audio: np.ndarray) -> str:
+        stream = self._recognizer.create_stream()
+        stream.accept_waveform(16000, audio)
+        self._recognizer.decode_stream(stream)
+        return stream.result.text.strip()
+
+
+class _WhisperCpp:
+    """The same weights on the Jetson's GPU, through whisper.cpp."""
+
+    name = "whisper.cpp"
+
+    def __init__(self, model: Path, lang: str, threads: int):
+        self.model, self.lang, self.threads = model, lang, threads
+        self._model = None
+
+    def available(self) -> bool:
+        if not self.model.exists():
+            return False
+        try:
+            import pywhispercpp                                # noqa: F401
+        except ImportError:
+            return False
+        return True
+
+    @staticmethod
+    def _preload() -> None:
+        """Open whisper.cpp's own libraries before the extension asks for them.
+
+        The wheel installs libwhisper and the ggml backends beside the package
+        rather than inside it, and nothing records where they went, so the
+        extension module fails to import with "libwhisper.so.1: cannot open
+        shared object file". Loading them here by absolute path puts them in
+        the process under the soname the extension is looking for, which is
+        the same thing LD_LIBRARY_PATH would do without needing the robot to
+        be started from a wrapper that sets it.
+
+        Order matters - ggml before whisper - and anything already loaded is
+        a no-op, so this is safe to call twice.
+        """
+        import ctypes
+        import sysconfig
+
+        lib = Path(sysconfig.get_paths()["purelib"])
+        for pattern in ("libggml-base.so.0", "libggml-cpu.so",
+                        "libggml-cuda.so.0", "libggml.so.0", "libwhisper.so.1"):
+            for path in sorted(lib.glob(pattern)):
+                try:
+                    ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
+                except OSError:
+                    pass          # optional backend, or already satisfied
+
+    def load(self) -> None:
+        self._preload()
+        from pywhispercpp.model import Model
+
+        self._model = Model(str(self.model), language=self.lang,
+                            n_threads=self.threads,
+                            print_progress=False, print_realtime=False,
+                            redirect_whispercpp_logs_to=None)
+
+    def transcribe(self, audio: np.ndarray) -> str:
+        segments = self._model.transcribe(audio)
+        return " ".join(s.text for s in segments).strip()
+
+
 class Listener:
     """
     Drains audio_service's utterance queue and publishes what was said.
@@ -129,14 +243,28 @@ class Listener:
     """
 
     def __init__(self, bus: EventBus, audio, *, lang: str = "en",
-                 model_dir: Path | None = None, threads: int = 4):
+                 model_dir: Path | None = None, threads: int = 4,
+                 engine: str = "auto"):
         self.bus = bus
         self.audio = audio
         self.lang = lang
         self.threads = threads
         self.model_dir = (model_dir or MODEL_DIR) / f"sherpa-onnx-whisper-{WHISPER}"
 
-        self._recognizer = None
+        gpu = _WhisperCpp(GGML_DIR / f"ggml-{WHISPER}.bin", lang, threads)
+        cpu = _Sherpa(self.model_dir, lang, threads)
+        if engine == "whispercpp":
+            wanted = [gpu]
+        elif engine == "sherpa":
+            wanted = [cpu]
+        else:
+            # Fastest first. "auto" picks whisper.cpp when its model and module
+            # are both installed, and says which it settled on at startup -
+            # eight times the speed is not something to discover by accident.
+            wanted = [gpu, cpu]
+        self._engine = next((e for e in wanted if e.available()), None)
+
+        self._loaded = False
         self._thread = threading.Thread(target=self._run, name="listener", daemon=True)
         self._stop = threading.Event()
         self.last_text = ""
@@ -147,9 +275,7 @@ class Listener:
         self.decoding = False
 
     def available(self) -> bool:
-        return all((self.model_dir / f).exists() for f in (
-            f"{WHISPER}-encoder.int8.onnx", f"{WHISPER}-decoder.int8.onnx",
-            f"{WHISPER}-tokens.txt"))
+        return self._engine is not None
 
     def start(self) -> None:
         self._thread.start()
@@ -160,11 +286,8 @@ class Listener:
 
     def transcribe(self, audio: np.ndarray) -> str:
         """One utterance to text. Blocking; called on the listener thread."""
-        recognizer = self._load()
-        stream = recognizer.create_stream()
-        stream.accept_waveform(16000, self._with_tail(audio))
-        recognizer.decode_stream(stream)
-        return stream.result.text.strip()
+        self._load()
+        return self._engine.transcribe(self._with_tail(audio))
 
     @staticmethod
     def _with_tail(audio: np.ndarray) -> np.ndarray:
@@ -174,24 +297,18 @@ class Listener:
 
     # --------------------------------------------------------------- inner
 
-    def _load(self):
-        if self._recognizer is None:
-            import sherpa_onnx
-
-            started = time.monotonic()
-            self._recognizer = sherpa_onnx.OfflineRecognizer.from_whisper(
-                encoder=str(self.model_dir / f"{WHISPER}-encoder.int8.onnx"),
-                decoder=str(self.model_dir / f"{WHISPER}-decoder.int8.onnx"),
-                tokens=str(self.model_dir / f"{WHISPER}-tokens.txt"),
-                num_threads=self.threads, language=self.lang, task="transcribe")
-            # The first decode costs about four times the rest, so spend it now
-            # rather than on the first thing anybody says.
-            warm = self._recognizer.create_stream()
-            warm.accept_waveform(16000, np.zeros(16000, dtype=np.float32))
-            self._recognizer.decode_stream(warm)
-            log(f"[listener] whisper-{WHISPER} ready in "
-                  f"{time.monotonic() - started:.1f}s, listening in {self.lang}")
-        return self._recognizer
+    def _load(self) -> None:
+        if self._loaded:
+            return
+        started = time.monotonic()
+        self._engine.load()
+        # The first decode costs several times the rest - kernels, buffers, a
+        # warm cache - so spend it now rather than on the first thing anybody
+        # says.
+        self._engine.transcribe(np.zeros(16000, dtype=np.float32))
+        self._loaded = True
+        log(f"[listener] whisper-{WHISPER} on {self._engine.name} ready in "
+              f"{time.monotonic() - started:.1f}s, listening in {self.lang}")
 
     def _run(self) -> None:
         self._load()
