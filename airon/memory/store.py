@@ -59,6 +59,13 @@ MAX_PER_PERSON = 200
 #: Word overlap above which two memories are the same memory.
 DUPLICATE_OVERLAP = 0.6
 
+#: How much of a retraction has to match the memory it is retracting, and by
+#: how much it must beat the next best candidate. Measured against the phrase
+#: people actually use: "vergiss was ich über die Tabletten gesagt habe" shares
+#: about a third of its words with "nimmt seine Tabletten um acht".
+FORGET_OVERLAP = 0.34
+FORGET_MARGIN = 0.1
+
 #: Two sightings closer together than this are one visit. Somebody walking in
 #: and out of frame has not visited twice.
 VISIT_GAP_S = 30 * 60.0
@@ -260,6 +267,39 @@ class MemoryStore:
                             importance=max(0.0, min(importance, 1.0)))
             shelf.append(memory)
             self._prune(shelf)
+            return memory
+
+    def forget_memory(self, text: str, *, person_id: str | None = None) -> Memory | None:
+        """Drop the one thing that best matches `text`, and return it.
+
+        Looser than the duplicate threshold and fussier about ambiguity, for
+        the same reason: a person retracting something will not quote
+        themselves. "die Tabletten um acht" against a stored "nimmt seine
+        Tabletten um acht" scores 0.5 and would fail the 0.6 duplicate bar,
+        while plainly meaning it.
+
+        So the bar is lower, and the best match must beat the runner-up
+        clearly. Deleting the wrong memory is much worse than deleting none -
+        the person believes it is gone, and it is not - so two things that
+        match about equally well means neither is dropped.
+        """
+        text = " ".join(text.split())
+        if len(text) < 3:
+            return None
+        with self._lock:
+            shelf = (self.people[person_id].memories
+                     if person_id is not None and person_id in self.people
+                     else self.world if person_id is None else None)
+            if not shelf:
+                return None
+            scored = sorted(((overlap(m.text, text), m) for m in shelf),
+                            key=lambda pair: pair[0], reverse=True)
+            best, memory = scored[0]
+            if best < FORGET_OVERLAP:
+                return None
+            if len(scored) > 1 and best - scored[1][0] < FORGET_MARGIN:
+                return None
+            shelf.remove(memory)
             return memory
 
     def _prune(self, shelf: list[Memory]) -> None:

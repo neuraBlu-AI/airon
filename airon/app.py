@@ -25,9 +25,11 @@ from .brain import BrainService
 from .brain.conversation import Conversation
 from .core import EventBus, EventType, StateStore, load_env, log
 from .face import FaceAnimator, FaceWindow
+from .face.weathercard import WeatherCard
 from .face.overlay import build as build_overlays
 from .memory import MemoryService
 from .speech import ENGINES, Listener, SpeechService
+from .world import Weather
 from .vision import VisionService
 
 
@@ -113,6 +115,11 @@ def main(argv=None) -> int:
 
     store = StateStore()
     bus = EventBus()
+    weather = Weather()
+    if weather.configured():
+        log(f"[aiRon] weather: {weather.place or weather.latlon}")
+    else:
+        log("[aiRon] no weather - set AIRON_WEATHER_PLACE in .env")
     bus.subscribe(lambda event: log(f"[event] {event}"))
 
     try:
@@ -184,7 +191,8 @@ def main(argv=None) -> int:
     brain = BrainService(bus, speech=speech, vision=vision, face=animator,
                          memory=memory, conversation=conversation, lang=args.lang,
                          can_listen=listener is not None,
-                         ears=ears, listener=listener)
+                         ears=ears, listener=listener, store=store,
+                         weather=weather)
     brain.start()
 
     def on_camera(event):
@@ -202,6 +210,9 @@ def main(argv=None) -> int:
     overlays = build_overlays(bus, vision,
                               preview=args.preview or args.inspect,
                               transcript=args.transcript or args.inspect)
+    # Not a test panel: this one is aiRon showing somebody something, so it
+    # is on whenever there is a forecast to show and off the rest of the time.
+    overlays.append(WeatherCard(weather, lang=args.lang))
 
     # Only now, once everything that listens has been built. Vision publishes
     # PERSON_ENTERED and KNOWN_PERSON_DETECTED the instant it sees a face, and

@@ -59,6 +59,13 @@ class FaceCommand:
     attention_y: float = 0.0
     speaking: bool = False
     intensity: float = 0.7
+    #: Who to look at, when it is not simply whoever is most prominent. The
+    #: face follows world.primary by itself, which is right with one person
+    #: in the room and wrong with two - "look at Max" has to be able to mean
+    #: Max rather than whoever happens to be nearest. Ignored the moment that
+    #: person is no longer visible, so it needs no expiry: the face falls back
+    #: to the primary on its own.
+    attention_person: str | None = None
 
     @property
     def pose(self) -> Emotion:
@@ -104,6 +111,9 @@ class FaceAnimator:
     def tick(self, dt: float, world: WorldState) -> None:
         self._t += dt
         person = world.primary
+        if self.command.attention_person is not None:
+            person = next((p for p in world.people
+                           if p.id == self.command.attention_person), person)
         pose = self.command.pose
         gain = self.command.intensity
 
