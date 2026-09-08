@@ -90,6 +90,12 @@ class SpeechService:
         self._lock = threading.Lock()
         self._speaking = False
         self._level = 0.0
+        #: Queued but not yet playing. A reply now arrives one sentence at a
+        #: time, so between two of them there is a moment with nothing coming
+        #: out of the speakers and more still to say. Without counting these,
+        #: `speaking` goes false in that gap, the microphone unmutes mid-reply
+        #: and aiRon can hear the end of its own sentence come back at it.
+        self._pending = 0
 
         self._thread = threading.Thread(target=self._run, name="speech", daemon=True)
         self._stop = threading.Event()
@@ -98,8 +104,9 @@ class SpeechService:
 
     @property
     def speaking(self) -> bool:
+        """Talking, or about to be. Gates the microphone - see `_pending`."""
         with self._lock:
-            return self._speaking
+            return self._speaking or self._pending > 0
 
     @property
     def level(self) -> float:
@@ -114,6 +121,8 @@ class SpeechService:
         """Queue a line. Returns immediately; nothing here blocks the caller."""
         text = text.strip()
         if text:
+            with self._lock:
+                self._pending += 1
             self._queue.put(Utterance(text, lang or detect_language(text, self.default_lang)))
 
     def stop(self) -> None:
@@ -152,6 +161,9 @@ class SpeechService:
                 log(f"[speech] failed to say {item.text!r}: {str(exc)[:100]}")
                 with self._lock:
                     self._speaking, self._level = False, 0.0
+            finally:
+                with self._lock:
+                    self._pending = max(0, self._pending - 1)
 
     def _speak(self, utterance: Utterance) -> None:
         from piper.config import SynthesisConfig

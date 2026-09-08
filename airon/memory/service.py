@@ -129,14 +129,30 @@ class MemoryService:
 
     def _said(self, text: str) -> None:
         if text:
-            self._note("airon", text)
+            # joins=True because a reply now reaches the speaker one sentence
+            # at a time, so aiRon saying one thing raises several of these.
+            self._note("airon", text, joins=True)
 
-    def _note(self, speaker: str, text: str) -> None:
+    def _note(self, speaker: str, text: str, *, joins: bool = False) -> None:
+        """Add a turn to the running exchange.
+
+        With `joins`, a line by the same speaker extends the previous one
+        instead of becoming a turn of its own. The brain streams a reply out
+        in sentences, and without this a single answer would fill several
+        slots of a short buffer - aiRon would remember the last three things
+        it said and nothing anybody else did. Two genuinely separate replies
+        cannot merge by accident: anything the person says lands between them
+        and breaks the run.
+        """
         now = time.time()
         if now - self._last_turn > CONVERSATION_IDLE_S:
             self._turns.clear()
         self._last_turn = now
-        self._turns.append((speaker, " ".join(text.split())))
+        line = " ".join(text.split())
+        if joins and self._turns and self._turns[-1][0] == speaker:
+            self._turns[-1] = (speaker, f"{self._turns[-1][1]} {line}".strip())
+            return
+        self._turns.append((speaker, line))
 
     # --------------------------------------------------------------- public
 
