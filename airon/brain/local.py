@@ -36,7 +36,7 @@ from pathlib import Path
 from ..core.log import log
 from ..face.expression import EMOTIONS
 from .conversation import (LANGUAGE_NAMES, MAX_TOKENS, PERSONALITY, REPLY_SCHEMA,
-                           Reply, _Spoken, _tidy)
+                           Reply, _Spoken, _tidy, now_line)
 
 MODEL_DIR = Path(__file__).resolve().parent.parent.parent / "models" / "llm"
 
@@ -113,7 +113,8 @@ class LocalConversation:
             language=LANGUAGE_NAMES[self.lang],
             emotions=", ".join(sorted(EMOTIONS)),
         )
-        return f"{personality}\n\nWho you are talking to:\n{context}"
+        return (f"{personality}\n\nRight now it is {now_line()}.\n\n"
+                f"Who you are talking to:\n{context}")
 
     def _load(self):
         if self._llm is None:

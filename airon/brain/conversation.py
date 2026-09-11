@@ -32,6 +32,7 @@ import re
 import os
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from ..core.log import log
 from ..face.expression import EMOTIONS
@@ -78,6 +79,33 @@ TIMEOUT_ENV = "AIRON_LLM_TIMEOUT"
 
 LANGUAGE_NAMES = {"de": "German", "en": "English"}
 
+
+def now_line() -> str:
+    """The date and time, as one line for the prompt.
+
+    AIRON-27. Asked what day it was, aiRon answered "Sonntag, der 16. August
+    2026" on a Friday in September - not because it looked it up wrongly but
+    because nothing had ever told it, and a model with no clock answers from
+    the shape of its training data rather than saying it does not know.
+
+    A tool would not have fixed that. The model has to decide to call one,
+    and a model that believes it knows the date does not call anything; the
+    failure was aiRon stating the date in passing, having been asked about
+    something else entirely. So this is context rather than a capability:
+    aiRon knows what time it is the way anybody in the room does.
+
+    Local time from the robot's own clock, with the zone named so that half
+    past six means something, and the weekday spelled out because that is
+    the part people ask about and the part a date alone does not give. It is
+    rebuilt for every turn, which is the whole point - and it goes in the
+    block that is not cached, because a line that changes every minute in
+    the block that never changes would throw the personality cache away
+    sixty times an hour.
+    """
+    when = datetime.now().astimezone()
+    return (f"{when:%A} {when.day} {when:%B %Y}, {when:%H:%M}"
+            f"{f' {when:%Z}' if when.tzname() else ''}")
+
 PERSONALITY = """\
 You are aiRon: a small social robot with a screen for a face, one camera and a
 microphone array. You are speaking out loud to somebody standing in front of
@@ -97,6 +125,10 @@ What you know:
 - Never invent a memory, a name, or a fact you were not given.
 - Speech reaches you through a microphone and is often misheard. If a line
   makes no sense, say you did not catch it rather than answering it.
+- You know the date and the time - they are below, from your own clock, and
+  they are right. Never say you cannot know them, and never guess at them.
+  Do not announce them either: mention the time the way a person in the room
+  would, when it is asked for or when it matters.
 
 Your face:
 - Choose the emotion that fits what you are saying, from this list only:
@@ -535,9 +567,11 @@ class Conversation:
 
     def system(self, context: str) -> list[dict]:
         """
-        Two blocks: the character, which never changes, and who aiRon is
-        looking at, which changes per person. The stable half is cached, so
-        the personality is not re-billed every time somebody speaks.
+        Two blocks: the character, which never changes, and what is true
+        right now, which changes every turn. The stable half is cached, so
+        the personality is not re-billed every time somebody speaks - and
+        the clock is deliberately in the other half, because a cached block
+        with the time in it is a cache that is never once hit.
         """
         personality = PERSONALITY.format(
             language=LANGUAGE_NAMES[self.lang],
@@ -545,7 +579,8 @@ class Conversation:
         )
         return [
             {"type": "text", "text": personality, "cache_control": {"type": "ephemeral"}},
-            {"type": "text", "text": f"Who you are talking to:\n{context}"},
+            {"type": "text", "text": f"Right now it is {now_line()}.\n\n"
+                                     f"Who you are talking to:\n{context}"},
         ]
 
     def _stream(self, *, system, messages: list[dict], schema: dict,

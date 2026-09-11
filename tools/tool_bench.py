@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -28,7 +29,8 @@ from airon.world.weather import Forecast                    # noqa: E402
 from airon.core.events import Person, WorldState             # noqa: E402
 from airon.face.expression import FaceAnimator               # noqa: E402
 from airon.memory.service import MemoryService               # noqa: E402
-from airon.brain.conversation import FOUND_SCHEMA            # noqa: E402
+from airon.brain.conversation import (Conversation,          # noqa: E402
+                                      FOUND_SCHEMA)
 from airon.core import EventBus, StateStore                  # noqa: E402
 
 PASSED, FAILED = [], []
@@ -179,6 +181,20 @@ def main() -> int:
     check("no memory, no face, no crash", empty.run(
         [Action("remember", "x"), Action("look_at", "y"), Action("forget", "z")],
         person=None), [])
+
+    print("\nwhat aiRon is told about now (AIRON-27)")
+    blocks = Conversation(lang="de").system("André")
+    year = str(datetime.now().year)
+    check("the current date reaches the model at all",
+          year in blocks[1]["text"], True)
+    # The one worth a test rather than a read. A line that changes every
+    # minute, put in the block that never changes, is a personality cache
+    # that is never once hit - and nothing about the robot looks wrong when
+    # that happens, so nothing would ever catch it except this.
+    check("and never from the cached block",
+          "cache_control" in blocks[0] and year not in blocks[0]["text"], True)
+    check("aiRon is told it knows the time, not that it might",
+          "never say you cannot know" in blocks[0]["text"].lower(), True)
 
     print("\nwhat the model cannot reach")
     for forbidden in ("end_conversation", "enrol", "enroll_face", "set_name",
