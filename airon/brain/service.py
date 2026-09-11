@@ -136,7 +136,7 @@ class BrainService:
     def __init__(self, bus: EventBus, *, speech=None, vision=None, face=None,
                  memory=None, conversation=None, lang: str = "en",
                  can_listen: bool = False, ears=None, listener=None, store=None,
-                 weather=None):
+                 weather=None, search=None):
         self.bus = bus
         self.speech = speech
         self.vision = vision
@@ -154,7 +154,7 @@ class BrainService:
         # actions is visible here rather than implied by what a tool happens
         # to import (AIRON-8). After self.lang, which it needs.
         self.toolbox = Toolbox(memory=memory, face=face, store=store,
-                               weather=weather, lang=self.lang)
+                               weather=weather, search=search, lang=self.lang)
 
         self._lock = threading.Lock()
         self._greeted: dict[str, float] = {}
@@ -484,6 +484,10 @@ class BrainService:
                 # is asking a language model what tomorrow will be like.
                 if outcome.speak and self.speech is not None and self._present == person:
                     self.speech.say(outcome.speak, lang=self.lang)
+                # And a tool that fetched something no template can say gets
+                # the model asked a second time. Only search does this.
+                if outcome.found is not None:
+                    self._answer_from(outcome.found, heard, person, speak, wear)
 
         if not wore:                     # the stream never got as far as a face
             self._look(reply.emotion)
@@ -495,6 +499,36 @@ class BrainService:
                 f"whole reply in {reply.seconds:.1f}s")
 
         self._remember(reply, person)
+
+    def _answer_from(self, findings, heard: str, person: str | None,
+                     speak, wear) -> None:
+        """Say what the search found, once it has been found.
+
+        The half of a searched turn that happens after the search. aiRon has
+        already said it would look and the words are still in the air; this
+        asks the model what to make of what came back and speaks that, down
+        the same two callbacks as the first half - so the same rule applies,
+        and an answer composed for somebody who has since walked away is
+        abandoned rather than said to whoever is standing there now.
+
+        The local brain has no `answer_from`, and no tools either, so this
+        cannot be reached from it - but it is asked for rather than assumed,
+        because "the brain cannot do this" should read as a quiet log line
+        and not as an AttributeError in the middle of a conversation.
+        """
+        answer_from = getattr(self.conversation, "answer_from", None)
+        if answer_from is None:
+            log("[brain] searched, but this brain cannot answer from findings")
+            return
+        self._look("thinking")
+        context = self.memory.context_for(person) if self.memory else ""
+        answer = answer_from(findings, question=heard, context=context,
+                             on_emotion=wear, on_sentence=speak)
+        if answer is None:
+            log(f"[brain] nothing to say about {findings.query!r}")
+            return
+        log(f"[brain] answered from the web in {answer.seconds:.1f}s "
+            f"(first words in {answer.first_words:.1f}s)")
 
     def _remember(self, reply, person: str | None) -> None:
         """

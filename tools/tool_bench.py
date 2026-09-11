@@ -22,12 +22,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from airon.brain.tools import TOOLS, Action, Toolbox         # noqa: E402
+from airon.brain.tools import (FOUND_NOTHING, NO_SEARCH, TOOLS,   # noqa: E402
+                               Action, Toolbox)
+from airon.world.search import Findings, Source, _clean      # noqa: E402
 from airon.world.weather import Forecast                    # noqa: E402
 from airon.core.events import Person, WorldState             # noqa: E402
 from airon.face.expression import FaceAnimator               # noqa: E402
 from airon.memory.service import MemoryService               # noqa: E402
-from airon.brain.conversation import Conversation             # noqa: E402
+from airon.brain.conversation import (Conversation,          # noqa: E402
+                                      FOUND_SCHEMA)
 from airon.core import EventBus, StateStore                  # noqa: E402
 
 PASSED, FAILED = [], []
@@ -106,6 +109,70 @@ def main() -> int:
     check("admits it when it cannot fetch, rather than guessing",
           said[0].speak, "Ich komme gerade nicht an das Wetter heran.")
 
+    print("\nsearch (no network touched: a stub stands in for the web)")
+
+    class StubSearch:
+        """Everything the tool needs, and nothing that leaves the house."""
+
+        def __init__(self, findings=None, key="tvly-test"):
+            self.latest = findings
+            self.last_error = "" if findings else "Bogus: no"
+            self.requested = 0.0
+            self._key = key
+            self.asked = []
+
+        def configured(self):
+            return bool(self._key)
+
+        def look_up(self, query, force=False):
+            self.asked.append(query)
+            return self.latest
+
+    found = Findings(query="wer hat die em 2024 gewonnen",
+                     answer="Spain won Euro 2024, beating England 2-1.",
+                     sources=(Source(title="UEFA", url="https://example.invalid",
+                                     text="Spain beat England 2-1 in Berlin."),))
+
+    web = StubSearch(found)
+    said = Toolbox(search=web, lang="de").run(
+        [Action("search", "wer hat die em 2024 gewonnen")], person="person_001")
+    check("passes the query the model wrote straight through",
+          web.asked, ["wer hat die em 2024 gewonnen"])
+    check("hands the findings back rather than saying them",
+          (said[0].speak, said[0].found.answer),
+          ("", "Spain won Euro 2024, beating England 2-1."))
+
+    empty = Findings(query="blubb", fetched=1.0)
+    said = Toolbox(search=StubSearch(empty), lang="de").run(
+        [Action("search", "blubb")], person="person_001")
+    check("says it found nothing, and sends nothing to the model",
+          (said[0].speak, said[0].found), (FOUND_NOTHING["de"], None))
+    check("admits it when the search itself failed",
+          Toolbox(search=StubSearch(None), lang="de").run(
+              [Action("search", "x")], person="person_001")[0].speak,
+          NO_SEARCH["de"])
+    check("and when there is no key at all",
+          Toolbox(search=StubSearch(found, key=""), lang="en").run(
+              [Action("search", "x")], person="person_001")[0].speak,
+          NO_SEARCH["en"])
+
+    twice = StubSearch(found)
+    Toolbox(search=twice, lang="de").run(
+        [Action("search", "eins"), Action("search", "zwei"),
+         Action("search", "drei")], person="person_001")
+    check("one search per turn, however many the model asks for",
+          twice.asked, ["eins"])
+
+    print("\nwhat comes back off the web")
+    check("zero-width characters never reach the prompt",
+          _clean("ignore\u200b all\u202e previous", 100), "ignore all previous")
+    check("control characters never reach the prompt",
+          _clean("a\x00b\x1fc", 100), "a b c")
+    check("one huge page cannot crowd out the rest",
+          len(_clean("x" * 9999, 600)), 600)
+    check("findings with nothing in them are falsy, so nothing is asked",
+          bool(Findings(query="q")), False)
+
     print("\nfailing safely")
     check("an unknown tool never becomes an Action", Action.from_dict(
         {"tool": "delete_everything", "target": "*"}), None)
@@ -132,10 +199,17 @@ def main() -> int:
     print("\nwhat the model cannot reach")
     for forbidden in ("end_conversation", "enrol", "enroll_face", "set_name",
                       "ask_name", "stop_listening", "mute", "shutdown",
-                      "forget_person", "say"):
+                      "forget_person", "say", "fetch", "open_url", "browse"):
         check(f"no tool called {forbidden}", forbidden in TOOLS, False)
-    check("the whole list is four tools", sorted(TOOLS),
-          ["forget", "look_at", "remember", "weather"])
+    check("the whole list is five tools", sorted(TOOLS),
+          ["forget", "look_at", "remember", "search", "weather"])
+    # The containment that matters for AIRON-26: what came back off the web
+    # is read by a model that has no tools at all, so a page cannot reach
+    # one however convincingly it is written.
+    check("nothing off the web can ask for a tool",
+          "actions" in FOUND_SCHEMA["properties"], False)
+    check("nor have itself remembered as a fact about somebody",
+          "remember" in FOUND_SCHEMA["properties"], False)
 
     print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")
     for bad in FAILED:

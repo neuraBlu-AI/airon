@@ -14,10 +14,15 @@ Four tools, and the list is short on purpose:
                model judged it worth keeping
     forget     retract one thing, without deleting the person
     weather    tomorrow's forecast, here or somewhere named; said and shown
+    search     look something up on the web, and answer from what came back
 
-Only `weather` reaches the network, to one host with coordinates from .env,
-and it says what it fetched rather than letting the model say it - the
-reasoning is in airon/world/weather.py. Nothing here is safety-critical.
+The last two reach the network and the first three do not. `weather` goes to
+one host with coordinates from .env and says what it fetched rather than
+letting the model say it; `search` cannot do that, because no template turns
+a web page into a spoken sentence, so it hands what it found back to the
+model under a prompt that treats it as a quotation. The reasoning for each is
+in airon/world/weather.py and airon/world/search.py. Nothing here is
+safety-critical.
 Section 20 says safety-critical behaviour must never depend solely on a
 language model, and that does not stop being true because the model is
 calling a function instead of talking.
@@ -32,12 +37,20 @@ avoid. The way to check that is to read TOOLS - if it is not there, the model
 cannot reach it.
 
 Requests arrive as data and are executed here, rather than through the API's
-tool-calling loop. That is a latency decision: none of these return
-anything the model needs to see - the weather tool says its own result -
-and a second round trip would double the wait for a robot whose whole
-conversation is already about four seconds.
-When a tool does need to hand something back - a battery level, a search
-result - that is the point to reach for the SDK's tool runner instead.
+tool-calling loop. That is a latency decision: three of these return nothing
+the model needs to see - the weather tool says its own result - and a second
+round trip would double the wait for a robot whose whole conversation is
+already about four seconds.
+
+`search` is the one that does need to hand something back, which AIRON-8
+anticipated and pointed at the SDK's tool runner for. It is not built that
+way, and the reason is that the tool runner goes quiet while it works: the
+model asks, the loop fetches, the model answers, and the person in front of
+the robot hears nothing for the whole of it. Keeping requests as data lets
+aiRon say "let me look" out of the first call, search while those words are
+in the air, and answer out of a second - the same two round trips, with the
+robot talking through the first one. What comes back rides on Outcome.found,
+and brain_service is what asks the model to turn it into speech.
 """
 
 from __future__ import annotations
@@ -45,12 +58,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..core.log import log
+from ..world.search import KEY_ENV, Findings
 from ..world.weather import NOWHERE
 
 #: Everything the model is allowed to ask for. The enum in the reply schema is
 #: built from this, so adding a name here is the only way to add a tool - and
 #: is a deliberate act, reviewable in a diff.
-TOOLS = ("look_at", "remember", "forget", "weather")
+TOOLS = ("look_at", "remember", "forget", "weather", "search")
 
 #: What an explicitly requested memory is worth. Higher than the model's own
 #: judgement calls, which sit near 0.4: somebody saying "remember this" is the
@@ -66,15 +80,48 @@ NO_WEATHER = {
     "de": "Ich komme gerade nicht an das Wetter heran.",
 }
 
+#: Said when a search could not be run at all - no key, no network, no
+#: answer from Tavily. Distinct from having searched and found nothing,
+#: below, because they are different things to be told by a robot that has
+#: just said it would go and look.
+NO_SEARCH = {
+    "en": "I could not look that up just now.",
+    "de": "Das konnte ich gerade nicht nachschlagen.",
+}
+
+#: Said when the search ran and came back empty. Nothing reaches the model
+#: in this case: there is nothing to answer from, and a model asked to
+#: answer from nothing is a model inventing an answer.
+FOUND_NOTHING = {
+    "en": "I looked, but I could not find anything about that.",
+    "de": "Ich habe nachgesehen, aber dazu finde ich nichts.",
+}
+
+#: One search per turn. The model asking twice in one reply is a model that
+#: has misread the room, and the cost of humouring it is paid by whoever is
+#: standing there waiting - so the second request is dropped rather than run.
+SEARCHES_PER_TURN = 1
+
 
 @dataclass(frozen=True)
 class Outcome:
-    """What a tool did. `speak` is a line for aiRon to say out loud, and only
-    the weather tool has one: it exists so a fact reaches the person as the
-    fact that was fetched, rather than as the model's memory of asking."""
+    """What a tool did.
+
+    `speak` is a line for aiRon to say out loud, and only the weather tool
+    has one: it exists so a fact reaches the person as the fact that was
+    fetched, rather than as the model's memory of asking.
+
+    `found` is the other shape, and only the search tool has it: what came
+    back cannot be said as it stands, because it is web prose rather than a
+    forecast with two numbers in it. It travels back to brain_service, which
+    asks the model to turn it into one spoken sentence. The two are
+    exclusive by construction - a tool either knows how to say its result or
+    hands it to somebody who does.
+    """
 
     log: str
     speak: str = ""
+    found: Findings | None = None
 
 
 @dataclass(frozen=True)
@@ -106,18 +153,26 @@ class Toolbox:
     """
 
     def __init__(self, *, memory=None, face=None, store=None, weather=None,
-                 lang: str = "en"):
+                 search=None, lang: str = "en"):
         self.memory = memory
         self.face = face
         self.store = store        # StateStore: who is currently visible
         self.weather = weather
+        self.search = search
         self.lang = lang
 
     def run(self, actions: list[Action], *, person: str | None) -> list[Outcome]:
         """Execute in order, and never raise: a bad tool call is a robot that
         did not do something, not a robot that fell over mid-sentence."""
         done = []
+        searches = 0
         for action in actions:
+            if action.tool == "search":
+                searches += 1
+                if searches > SEARCHES_PER_TURN:
+                    log(f"[tool] ignoring a second search this turn: "
+                        f"{action.target!r}")
+                    continue
             try:
                 outcome = getattr(self, f"_{action.tool}")(action.target, person)
             except Exception as exc:                    # a tool, not the turn
@@ -191,6 +246,37 @@ class Toolbox:
         return Outcome(f"tomorrow in {forecast.place}: {forecast.condition}, "
                        f"{forecast.low}-{forecast.high}C",
                        forecast.sentence(self.lang))
+
+    def _search(self, target: str, person: str | None) -> Outcome:
+        """Look something up, and hand back what was found rather than say it.
+
+        The one tool whose result the model has to see. Everything else here
+        either does something silently or reads a template out loud; a search
+        returns paragraphs written by strangers, and turning those into one
+        sentence a robot says is a judgement, which means a second call.
+
+        Three outcomes, said differently on purpose. Not being able to search
+        at all, searching and finding nothing, and finding something are three
+        different things to be told by a robot that has just announced it was
+        going to go and look - and only the third is worth waking the model
+        for, because a model asked to answer from nothing invents an answer.
+        """
+        if self.search is None:
+            return Outcome("")
+        if not self.search.configured():
+            return Outcome(f"no search: no {KEY_ENV} in .env",
+                           NO_SEARCH.get(self.lang, NO_SEARCH["en"]))
+        findings = self.search.look_up(target)
+        if findings is None:
+            return Outcome(f"no search: {self.search.last_error}",
+                           NO_SEARCH.get(self.lang, NO_SEARCH["en"]))
+        if not findings:
+            return Outcome(f"searched for {target!r} and found nothing",
+                           FOUND_NOTHING.get(self.lang, FOUND_NOTHING["en"]))
+        return Outcome(f"searched for {findings.query!r}: "
+                       f"{len(findings.sources)} results"
+                       f"{', with a summary' if findings.answer else ''}",
+                       found=findings)
 
     def _forget(self, target: str, person: str | None) -> str:
         """Retract one thing. Refusing is the safe outcome - see
