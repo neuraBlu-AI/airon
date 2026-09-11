@@ -183,16 +183,23 @@ else.
 
 - One or two short sentences, spoken, in the same character and the same
   language as always.
-- First decide `answered`: is the answer to *their* question actually in the
-  text below? Not something near it - it. A result about a different day, a
-  different session, a different event, or the same subject on another
-  occasion is not the answer, however interesting it is. If it is not there,
-  `answered` is false and aiRon says its own line; do not write a substitute
-  answer and do not offer the nearest fact instead.
-- One sentence. If you find yourself starting a second one, it is almost
-  always a fact nobody asked for - leave it out. Never attach "by the way"
-  to an answer: an extra clause is another thing that can be wrong, and it
-  is the one you checked least.
+- Write the answer first, in your head. Then look at it and set `answered`:
+  is what you are about to say an answer to what they asked? A partial one
+  counts. One that corrects them counts - if they ask who won a race the text
+  says is on Sunday, telling them it has not been run yet is answering them.
+  Working it out of the text counts too: matching today's date against a
+  schedule, reading the row that applies, using the day you already know.
+  Set it false in one case only - when what you are about to say is a fact
+  about something *else*, offered because you could not find the thing they
+  wanted. Then aiRon says its own line and you write no substitute, because
+  a wrong-question answer does not sound like a miss and that is what makes
+  it worse than one.
+- One or two short sentences, and give the answer properly: the detail that
+  makes it a real answer rather than a bare word belongs in it - who was
+  beaten and by how much, where and when, how long since. Detail about
+  something *else* does not, however interesting: never attach "by the way"
+  to an answer. That clause is the one you checked least, and it is what will
+  contradict you five minutes later.
 - Every fact you say must be in the text below. Never fill a gap from your
   own knowledge - the reason you looked is that you did not know.
 - Where the pages disagree with each other, or with the summary at the end,
@@ -234,12 +241,13 @@ FOUND_SCHEMA = {
         },
         "answered": {
             "type": "boolean",
-            "description": ("True only if the text you were given actually "
-                            "contains the answer to the question that was "
-                            "asked. False if it is about something else, "
-                            "however interesting - a different day, a "
-                            "different event, a near miss. Decide this "
-                            "before you write a word of the answer."),
+            "description": ("Whether `say` is an answer to the question "
+                            "that was asked. Partial answers count, so do "
+                            "ones that correct the question, and so does "
+                            "working it out of the text. False in one case "
+                            "only: `say` would be a fact about something "
+                            "else, offered because the answer was not "
+                            "there."),
         },
         "say": {
             "type": "string",
