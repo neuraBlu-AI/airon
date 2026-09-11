@@ -29,7 +29,7 @@ from .face.weathercard import WeatherCard
 from .face.overlay import build as build_overlays
 from .memory import MemoryService
 from .speech import ENGINES, Listener, SpeechService
-from .world import Weather
+from .world import Search, Weather
 from .vision import VisionService
 
 
@@ -123,6 +123,11 @@ def main(argv=None) -> int:
         log(f"[aiRon] weather: {weather.place or weather.latlon}")
     else:
         log("[aiRon] no weather - set AIRON_WEATHER_PLACE in .env")
+    search = Search()
+    # The name, never the value: startup says what aiRon can do, and a key
+    # printed into a log that gets pasted into a pull request is a key gone.
+    log("[aiRon] web search ready" if search.configured()
+        else "[aiRon] no web search - set TAVILY_API_KEY in .env")
     bus.subscribe(lambda event: log(f"[event] {event}"))
 
     try:
@@ -201,7 +206,7 @@ def main(argv=None) -> int:
                          memory=memory, conversation=conversation, lang=args.lang,
                          can_listen=listener is not None,
                          ears=ears, listener=listener, store=store,
-                         weather=weather)
+                         weather=weather, search=search)
     brain.start()
 
     def on_camera(event):
