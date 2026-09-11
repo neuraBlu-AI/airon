@@ -30,7 +30,7 @@ from airon.core.events import Person, WorldState             # noqa: E402
 from airon.face.expression import FaceAnimator               # noqa: E402
 from airon.memory.service import MemoryService               # noqa: E402
 from airon.brain.conversation import (Conversation,          # noqa: E402
-                                      FOUND_SCHEMA)
+                                      FOUND_SCHEMA, _Spoken)
 from airon.core import EventBus, StateStore                  # noqa: E402
 
 PASSED, FAILED = [], []
@@ -210,6 +210,23 @@ def main() -> int:
           "actions" in FOUND_SCHEMA["properties"], False)
     check("nor have itself remembered as a fact about somebody",
           "remember" in FOUND_SCHEMA["properties"], False)
+
+    print("\nadmitting the search missed (AIRON-31)")
+    fields = list(FOUND_SCHEMA["properties"])
+    check("a searched answer has to say whether it found anything",
+          "answered" in FOUND_SCHEMA["required"], True)
+    # The order is the mechanism, not tidiness: the reply is spoken sentence
+    # by sentence as it streams, so a verdict that arrives after the words is
+    # a verdict that arrives after they have been heard.
+    check("and says so before it says anything else",
+          fields.index("answered") < fields.index("say"), True)
+    running = _Spoken()
+    for piece in ('{"emotion":"curious", "answered"', ': fal', 'se, "say":"x"}'):
+        running.feed(piece)
+    check("the verdict is readable while the reply is still arriving",
+          running.answered, False)
+    check("and half of one is never mistaken for a verdict",
+          _Spoken().feed('{"answered": fal') or _Spoken().answered, None)
 
     print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")
     for bad in FAILED:

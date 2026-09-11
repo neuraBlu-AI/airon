@@ -36,7 +36,7 @@ from datetime import datetime
 
 from ..core.log import log
 from ..face.expression import EMOTIONS
-from .tools import TOOLS, Action
+from .tools import FOUND_NOTHING, TOOLS, Action
 
 #: Opus, because the whole point is that aiRon has a personality rather than
 #: an intent classifier. Cost is per conversation with a person standing in
@@ -183,13 +183,18 @@ else.
 
 - One or two short sentences, spoken, in the same character and the same
   language as always.
-- Answer the question they asked and stop. Do not add the surrounding
-  detail unless they asked for it - every extra clause is another thing that
-  can be wrong.
-- Every fact you say must be in the text below. If something is not there,
-  leave it out; if the answer itself is not there, say you could not find it
-  out. Never fill a gap from your own knowledge - the reason you looked is
-  that you did not know.
+- First decide `answered`: is the answer to *their* question actually in the
+  text below? Not something near it - it. A result about a different day, a
+  different session, a different event, or the same subject on another
+  occasion is not the answer, however interesting it is. If it is not there,
+  `answered` is false and aiRon says its own line; do not write a substitute
+  answer and do not offer the nearest fact instead.
+- One sentence. If you find yourself starting a second one, it is almost
+  always a fact nobody asked for - leave it out. Never attach "by the way"
+  to an answer: an extra clause is another thing that can be wrong, and it
+  is the one you checked least.
+- Every fact you say must be in the text below. Never fill a gap from your
+  own knowledge - the reason you looked is that you did not know.
 - Where the pages disagree with each other, or with the summary at the end,
   believe the pages.
 - No URLs, no source names, no "according to", no lists. Say it the way
@@ -213,19 +218,37 @@ use only the facts.
 #: person told aiRon about themselves.
 FOUND_SCHEMA = {
     "type": "object",
+    # Three fields, and the order of them is the mechanism rather than a
+    # tidiness. `answered` sits ahead of `say` so that the judgement has
+    # arrived while the words are still being written: a reply is spoken
+    # sentence by sentence as it streams, so a field read after the words is
+    # a field read after the person has heard them. Asking the model to
+    # commit to "is the answer actually in there" before it starts composing
+    # is also the point - AIRON-31 was a model that drifted into an adjacent
+    # fact while writing, having never been made to decide it had one.
     "properties": {
         "emotion": {
             "type": "string",
             "enum": sorted(EMOTIONS),
             "description": "The face to wear while saying it.",
         },
+        "answered": {
+            "type": "boolean",
+            "description": ("True only if the text you were given actually "
+                            "contains the answer to the question that was "
+                            "asked. False if it is about something else, "
+                            "however interesting - a different day, a "
+                            "different event, a near miss. Decide this "
+                            "before you write a word of the answer."),
+        },
         "say": {
             "type": "string",
-            "description": ("The answer, out loud. One or two short "
-                            "sentences, or that you could not find out."),
+            "description": ("The answer, out loud. One short sentence. Only "
+                            "read if `answered` is true - aiRon says its own "
+                            "line when it is false."),
         },
     },
-    "required": ["emotion", "say"],
+    "required": ["emotion", "answered", "say"],
     "additionalProperties": False,
 }
 
@@ -327,6 +350,13 @@ def _decoded(text: str) -> str:
 #: piece separately and puts a breath between them.
 SENTENCE_END = re.compile(r"[.!?…]['\")\]]*\s+(?=[A-ZÄÖÜ\"'])")
 
+#: The judgement field of a searched answer, read out of the half-finished
+#: document the same way the emotion is. It has to be read while the reply is
+#: still arriving rather than at the end, because by the end the words have
+#: already been spoken - which is the entire reason it is ordered ahead of
+#: them in the schema.
+ANSWERED = re.compile(r'"answered"\s*:\s*(true|false)')
+
 #: A JSON escape that has only half arrived. "\" could still become "\n",
 #: and "\u00" could still become "\u00e4" - decoding either now is wrong.
 HALF_ESCAPE = re.compile(r"(?<!\\)\\(?:u[0-9a-fA-F]{0,3})?$")
@@ -377,6 +407,10 @@ class _Spoken:
         self.raw = ""
         self.say = ""
         self.emotion = ""
+        #: Whether the model says it actually found what it was asked for.
+        #: None until the field has arrived, and it arrives before `say` on
+        #: purpose - see FOUND_SCHEMA. Only a searched answer has one.
+        self.answered: bool | None = None
         self._spoken = 0
 
     def feed(self, delta: str) -> list[str]:
@@ -384,6 +418,10 @@ class _Spoken:
         self.raw += delta
         if not self.emotion:
             self.emotion = _partial_string(self.raw, "emotion", whole=True) or ""
+        if self.answered is None:
+            found = ANSWERED.search(self.raw)
+            if found is not None:
+                self.answered = found.group(1) == "true"
         value = _partial_string(self.raw, "say")
         if value is not None:
             self.say = value
@@ -432,6 +470,9 @@ class _Streamed:
     #: other two mean the model declined to answer, and half of a declined
     #: answer is not an answer.
     broke: bool = False
+    #: A searched answer's own verdict on whether it found anything. None
+    #: for an ordinary reply, which is not asked the question.
+    answered: bool | None = None
 
 
 @dataclass
@@ -442,6 +483,10 @@ class Reply:
     #: What the model asked aiRon to do, as opposed to say. Usually empty.
     actions: list = field(default_factory=list)
     seconds: float = 0.0
+    #: False when a searched answer admitted the findings did not contain
+    #: what was asked for. True of everything else, including every ordinary
+    #: reply, which is never asked the question.
+    answered: bool = True
     #: When the first sentence was ready to speak, as opposed to when the
     #: whole reply was. The gap between the two is the point of streaming,
     #: and AIRON-12 asks for it measured rather than felt.
@@ -584,7 +629,7 @@ class Conversation:
         ]
 
     def _stream(self, *, system, messages: list[dict], schema: dict,
-                on_emotion=None, on_sentence=None) -> _Streamed:
+                on_emotion=None, on_sentence=None, gate=None) -> _Streamed:
         """One streamed call to the model, spoken as it arrives.
 
         Shared by both of the things aiRon asks a model for - what to say to
@@ -605,6 +650,9 @@ class Conversation:
             nonlocal first_words, keep_speaking
             if on_sentence is None or not keep_speaking or not sentence:
                 return
+            if gate is not None and not gate(spoken):
+                keep_speaking = False
+                return
             if not first_words:
                 first_words = time.monotonic() - started
             keep_speaking = on_sentence(sentence) is not False
@@ -614,7 +662,7 @@ class Conversation:
                 data=data, say=_tidy(spoken.say),
                 emotion=spoken.emotion if spoken.emotion in EMOTIONS else "idle",
                 first_words=first_words, seconds=time.monotonic() - started,
-                spoke=bool(first_words), broke=broke)
+                spoke=bool(first_words), broke=broke, answered=spoken.answered)
 
         try:
             with self._load().messages.stream(
@@ -686,8 +734,25 @@ class Conversation:
         streamed = self._stream(
             system=system,
             messages=[{"role": "user", "content": asked}],
-            schema=FOUND_SCHEMA, on_emotion=on_emotion, on_sentence=on_sentence)
+            schema=FOUND_SCHEMA, on_emotion=on_emotion, on_sentence=on_sentence,
+            # Nothing is spoken until the model has said it has an answer.
+            gate=lambda parsed: parsed.answered is True)
         data = streamed.data
+
+        # AIRON-31. Asked who was fastest in a practice session it had not
+        # found, aiRon said who led the championship instead - fluently, and
+        # in the same voice it uses for something it knows. The words are its
+        # own either way, so the guard cannot be a better instruction; it has
+        # to be that the words are never spoken. The gate above stops them,
+        # and this says the one line aiRon is allowed to say instead.
+        if streamed.answered is False:
+            missed = FOUND_NOTHING.get(self.lang, FOUND_NOTHING["en"])
+            if on_sentence is not None:
+                on_sentence(missed)
+            return Reply(say=missed, emotion=streamed.emotion, answered=False,
+                         seconds=streamed.seconds,
+                         first_words=streamed.first_words or streamed.seconds)
+
         if data is None:
             if streamed.broke and streamed.spoke:
                 return Reply(say=streamed.say, emotion=streamed.emotion,

@@ -527,7 +527,12 @@ class BrainService:
         if answer is None:
             log(f"[brain] nothing to say about {findings.query!r}")
             return
-        log(f"[brain] answered from the web in {answer.seconds:.1f}s "
+        # Worth distinguishing in the log, because from in front of the robot
+        # the two sound like the same kind of reply and only one of them is
+        # an answer (AIRON-31).
+        got = "answered from the web" if answer.answered else \
+              "found nothing that answered it"
+        log(f"[brain] {got} in {answer.seconds:.1f}s "
             f"(first words in {answer.first_words:.1f}s)")
 
     def _remember(self, reply, person: str | None) -> None:
