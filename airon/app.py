@@ -29,7 +29,7 @@ from .face.weathercard import WeatherCard
 from .face.overlay import build as build_overlays
 from .memory import MemoryService
 from .speech import ENGINES, Listener, SpeechService
-from .world import Search, Weather
+from .world import Project, Search, Weather
 from .vision import VisionService
 
 
@@ -128,6 +128,11 @@ def main(argv=None) -> int:
     # printed into a log that gets pasted into a pull request is a key gone.
     log("[aiRon] web search ready" if search.configured()
         else "[aiRon] no web search - set TAVILY_API_KEY in .env")
+    project = Project()
+    log("[aiRon] knows its own project"
+        + ("" if project.tracker_ready() else " (repository only - set "
+           "PLANE_API_KEY, PLANE_WORKSPACE and PLANE_PROJECT_ID in .env "
+           "for tickets)"))
     bus.subscribe(lambda event: log(f"[event] {event}"))
 
     try:
@@ -206,7 +211,7 @@ def main(argv=None) -> int:
                          memory=memory, conversation=conversation, lang=args.lang,
                          can_listen=listener is not None,
                          ears=ears, listener=listener, store=store,
-                         weather=weather, search=search)
+                         weather=weather, search=search, project=project)
     brain.start()
 
     def on_camera(event):

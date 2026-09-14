@@ -15,6 +15,8 @@ Four tools, and the list is short on purpose:
     forget     retract one thing, without deleting the person
     weather    tomorrow's forecast, here or somewhere named; said and shown
     search     look something up on the web, and answer from what came back
+    project    what aiRon has been working on, what is open, what broke
+    report     put one ticket in the tracker, and say that it did
 
 The last two reach the network and the first three do not. `weather` goes to
 one host with coordinates from .env and says what it fetched rather than
@@ -58,13 +60,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..core.log import log
+from ..world.project import KEY_ENV as TRACKER_ENV
 from ..world.search import KEY_ENV, Findings
 from ..world.weather import NOWHERE
 
 #: Everything the model is allowed to ask for. The enum in the reply schema is
 #: built from this, so adding a name here is the only way to add a tool - and
 #: is a deliberate act, reviewable in a diff.
-TOOLS = ("look_at", "remember", "forget", "weather", "search")
+TOOLS = ("look_at", "remember", "forget", "weather", "search",
+         "project", "report")
 
 #: What an explicitly requested memory is worth. Higher than the model's own
 #: judgement calls, which sit near 0.4: somebody saying "remember this" is the
@@ -96,6 +100,26 @@ FOUND_NOTHING = {
     "en": "I looked, but I could not find anything about that.",
     "de": "Ich habe nachgesehen, aber dazu finde ich nichts.",
 }
+
+#: Said when the tracker cannot be reached, or would not take the ticket.
+#: An admission rather than a shrug: somebody who has just been told their
+#: complaint was written down should not find out later that it was not.
+NO_TICKET = {
+    "en": "I could not write that down in the tracker just now.",
+    "de": "Ich konnte das gerade nicht ins Ticket-System eintragen.",
+}
+
+#: Said when one was filed. Built here rather than left to the model for the
+#: same reason the forecast is: the person should hear what was actually
+#: written down, under the number it was written down as.
+FILED = {
+    "en": "I have written that down as {ticket}.",
+    "de": "Ich habe das als {ticket} notiert.",
+}
+
+#: One ticket per turn, for the same reason as one search: a model that has
+#: misread the room should cost one row in the tracker, not nine.
+REPORTS_PER_TURN = 1
 
 #: One search per turn. The model asking twice in one reply is a model that
 #: has misread the room, and the cost of humouring it is paid by whoever is
@@ -131,6 +155,10 @@ class Action:
 
     tool: str
     target: str = ""
+    #: A second string, for the one tool that needs more than a name. `report`
+    #: uses it for the sentence under the title; everything else leaves it
+    #: empty, which is why it is not called `title` and `body`.
+    detail: str = ""
 
     @classmethod
     def from_dict(cls, raw: dict) -> "Action | None":
@@ -139,7 +167,9 @@ class Action:
         tool = str(raw.get("tool", "")).strip()
         if tool not in TOOLS:
             return None
-        return cls(tool=tool, target=" ".join(str(raw.get("target", "")).split()))
+        return cls(tool=tool,
+                   target=" ".join(str(raw.get("target", "")).split()),
+                   detail=" ".join(str(raw.get("detail", "")).split()))
 
 
 class Toolbox:
@@ -153,19 +183,20 @@ class Toolbox:
     """
 
     def __init__(self, *, memory=None, face=None, store=None, weather=None,
-                 search=None, lang: str = "en"):
+                 search=None, project=None, lang: str = "en"):
         self.memory = memory
         self.face = face
         self.store = store        # StateStore: who is currently visible
         self.weather = weather
         self.search = search
+        self.project = project
         self.lang = lang
 
     def run(self, actions: list[Action], *, person: str | None) -> list[Outcome]:
         """Execute in order, and never raise: a bad tool call is a robot that
         did not do something, not a robot that fell over mid-sentence."""
         done = []
-        searches = 0
+        searches = reports = 0
         for action in actions:
             if action.tool == "search":
                 searches += 1
@@ -173,8 +204,14 @@ class Toolbox:
                     log(f"[tool] ignoring a second search this turn: "
                         f"{action.target!r}")
                     continue
+            if action.tool == "report":
+                reports += 1
+                if reports > REPORTS_PER_TURN:
+                    log(f"[tool] ignoring a second ticket this turn: "
+                        f"{action.target!r}")
+                    continue
             try:
-                outcome = getattr(self, f"_{action.tool}")(action.target, person)
+                outcome = getattr(self, f"_{action.tool}")(action, person)
             except Exception as exc:                    # a tool, not the turn
                 outcome = Outcome(f"{action.tool} failed: "
                                   f"{type(exc).__name__}: {exc}")
@@ -187,7 +224,7 @@ class Toolbox:
 
     # ------------------------------------------------------------ the tools
 
-    def _look_at(self, target: str, person: str | None) -> str:
+    def _look_at(self, action: "Action", person: str | None) -> str:
         """Point the face at somebody who is actually in the room.
 
         Resolved against what the camera can see right now, not against the
@@ -197,27 +234,27 @@ class Toolbox:
         if self.face is None or self.store is None:
             return ""
         world = self.store.get()
-        wanted = target.strip().lower()
+        wanted = action.target.strip().lower()
         match = next((p for p in world.people
-                      if (p.name or "").lower() == wanted or p.id == target), None)
+                      if (p.name or "").lower() == wanted or p.id == action.target), None)
         if match is None and wanted in ("them", "the speaker", "whoever spoke"):
             match = next((p for p in world.people if p.id == person), None)
         if match is None:
-            return f"not looking at {target!r} - nobody here by that name"
+            return f"not looking at {action.target!r} - nobody here by that name"
         self.face.command.attention_person = match.id
         return f"looking at {match.name or match.id}"
 
-    def _remember(self, target: str, person: str | None) -> str:
+    def _remember(self, action: "Action", person: str | None) -> str:
         """Keep something because it was asked for, not because it was judged."""
-        if self.memory is None or not target:
+        if self.memory is None or not action.target:
             return ""
-        memory = self.memory.remember(target, person_id=person, kind="fact",
+        memory = self.memory.remember(action.target, person_id=person, kind="fact",
                                       importance=ASKED_IMPORTANCE)
         if memory is None:
-            return f"could not remember {target!r}"
+            return f"could not remember {action.target!r}"
         return f"remembered on request: {memory.text!r}"
 
-    def _weather(self, target: str, person: str | None) -> Outcome:
+    def _weather(self, action: "Action", person: str | None) -> Outcome:
         """Tomorrow's forecast: fetched, shown, and read out.
 
         The spoken line is built from the response rather than left to the
@@ -231,23 +268,23 @@ class Toolbox:
             return Outcome("no weather: nowhere configured - set "
                            "AIRON_WEATHER_PLACE in .env",
                            NO_WEATHER.get(self.lang, NO_WEATHER["en"]))
-        forecast = self.weather.tomorrow(target)
+        forecast = self.weather.tomorrow(action.target)
         if forecast is None:
             # A place nobody can find is a different answer from a network
             # that will not answer, and saying so is the difference between
             # aiRon looking broken and aiRon looking like it misheard - which
             # is usually what actually happened.
-            if target and "no such place" in self.weather.last_error:
-                return Outcome(f"no such place: {target!r}",
+            if action.target and "no such place" in self.weather.last_error:
+                return Outcome(f"no such place: {action.target!r}",
                                NOWHERE.get(self.lang, NOWHERE["en"]).format(
-                                   place=target))
+                                   place=action.target))
             return Outcome(f"no weather: {self.weather.last_error}",
                            NO_WEATHER.get(self.lang, NO_WEATHER["en"]))
         return Outcome(f"tomorrow in {forecast.place}: {forecast.condition}, "
                        f"{forecast.low}-{forecast.high}C",
                        forecast.sentence(self.lang))
 
-    def _search(self, target: str, person: str | None) -> Outcome:
+    def _search(self, action: "Action", person: str | None) -> Outcome:
         """Look something up, and hand back what was found rather than say it.
 
         The one tool whose result the model has to see. Everything else here
@@ -266,25 +303,74 @@ class Toolbox:
         if not self.search.configured():
             return Outcome(f"no search: no {KEY_ENV} in .env",
                            NO_SEARCH.get(self.lang, NO_SEARCH["en"]))
-        findings = self.search.look_up(target)
+        findings = self.search.look_up(action.target)
         if findings is None:
             return Outcome(f"no search: {self.search.last_error}",
                            NO_SEARCH.get(self.lang, NO_SEARCH["en"]))
         if not findings:
-            return Outcome(f"searched for {target!r} and found nothing",
+            return Outcome(f"searched for {action.target!r} and found nothing",
                            FOUND_NOTHING.get(self.lang, FOUND_NOTHING["en"]))
         return Outcome(f"searched for {findings.query!r}: "
                        f"{len(findings.sources)} results"
                        f"{', with a summary' if findings.answer else ''}",
                        found=findings)
 
-    def _forget(self, target: str, person: str | None) -> str:
+    def _project(self, action: "Action", person: str | None) -> Outcome:
+        """What aiRon has been working on, what is open, and what has broken.
+
+        Findings, like a search, and for the same reason: there is no cheap
+        way to search a repository for the answer to a spoken question, so
+        the project's actual state goes to the model and the model finds the
+        answer in it - or admits it cannot, which AIRON-31 made it able to do.
+
+        Everything here is read. The repository is read from the local clone
+        with no credentials at all, the tracker read-only over its own key.
+        Nothing in this tool can change a line of aiRon.
+        """
+        if self.project is None:
+            return Outcome("")
+        findings = self.project.look_up(action.target)
+        if not findings:
+            return Outcome("nothing to say about the project - no repository "
+                           f"and no tracker ({self.project.last_error})",
+                           FOUND_NOTHING.get(self.lang, FOUND_NOTHING["en"]))
+        return Outcome(f"looked itself up: {len(findings.sources)} things known"
+                       f"{' (tracker off)' if not self.project.tracker_ready() else ''}",
+                       found=findings)
+
+    def _report(self, action: "Action", person: str | None) -> Outcome:
+        """Put one ticket in the tracker, and say so under its number.
+
+        The only tool aiRon has that writes anywhere outside its own memory,
+        which is why what it says is a template rather than the model's
+        account of what it did: somebody told their complaint was written
+        down should hear the number it was written down as, and should find
+        out immediately when it was not.
+
+        The refusals live in Project.file_ticket - no title, no key, the same
+        thing twice, too many in one run - because they are about the tracker
+        rather than about the conversation. This is only where they are said.
+        """
+        if self.project is None:
+            return Outcome("")
+        if not self.project.tracker_ready():
+            return Outcome(f"no ticket: no {TRACKER_ENV} in .env",
+                           NO_TICKET.get(self.lang, NO_TICKET["en"]))
+        filed = self.project.file_ticket(action.target, action.detail)
+        if filed is None:
+            return Outcome(f"no ticket: {self.project.last_error}",
+                           NO_TICKET.get(self.lang, NO_TICKET["en"]))
+        return Outcome(f"filed {filed.identifier}: {filed.title!r}",
+                       FILED.get(self.lang, FILED["en"]).format(
+                           ticket=filed.identifier))
+
+    def _forget(self, action: "Action", person: str | None) -> str:
         """Retract one thing. Refusing is the safe outcome - see
         MemoryStore.forget_memory, which would rather drop nothing than drop
         the wrong thing and leave the person believing it is gone."""
-        if self.memory is None or not target:
+        if self.memory is None or not action.target:
             return ""
-        memory = self.memory.forget_memory(target, person_id=person)
+        memory = self.memory.forget_memory(action.target, person_id=person)
         if memory is None:
-            return f"nothing close enough to {target!r} to forget"
+            return f"nothing close enough to {action.target!r} to forget"
         return f"forgot on request: {memory.text!r}"

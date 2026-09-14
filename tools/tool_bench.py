@@ -22,8 +22,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from airon.brain.tools import (FOUND_NOTHING, NO_SEARCH, TOOLS,   # noqa: E402
-                               Action, Toolbox)
+from airon.brain.tools import (FOUND_NOTHING, NO_SEARCH,         # noqa: E402
+                               NO_TICKET, TOOLS, Action, Toolbox)
+from airon.world.project import Filed, SAME_TICKET, _alike   # noqa: E402
 from airon.world.search import Findings, Source, _clean      # noqa: E402
 from airon.world.weather import Forecast                    # noqa: E402
 from airon.core.events import Person, WorldState             # noqa: E402
@@ -173,6 +174,75 @@ def main() -> int:
     check("findings with nothing in them are falsy, so nothing is asked",
           bool(Findings(query="q")), False)
 
+    print("\nits own project (AIRON-32)")
+
+    class StubTracker:
+        """A Project with the tracker answered locally, so no key is needed
+        and nothing is ever really filed."""
+
+        def __init__(self, ready=True):
+            self.ready = ready
+            self.last_error = ""
+            self.filed = []
+            self.requested = 0.0
+
+        def tracker_ready(self):
+            return self.ready
+
+        def look_up(self, question=""):
+            return Findings(query=question or "aiRon's own project",
+                            sources=(Source(title="Recent commits", url="",
+                                            text="AIRON-31 ask whether it is "
+                                                 "substituting"),), fetched=1.0)
+
+        def file_ticket(self, title, detail=""):
+            if not title:
+                self.last_error = "nothing to file"
+                return None
+            if any(_alike(f.title, title) >= SAME_TICKET for f in self.filed):
+                self.last_error = f"already filed as {self.filed[0].identifier}"
+                return None
+            filed = Filed(identifier=f"AIRON-{90 + len(self.filed)}",
+                          title=title, url="https://example.invalid")
+            self.filed.append(filed)
+            return filed
+
+    box = Toolbox(project=StubTracker(), lang="de")
+    said = box.run([Action("project", "woran arbeitest du gerade?")], person="person_001")
+    check("what it knows about itself goes to the model, not out loud",
+          (said[0].speak, bool(said[0].found)), ("", True))
+
+    said = box.run([Action("report", "Mikrofon fällt aus",
+                           "Das Array liefert nach einer Weile keine Samples mehr.")],
+                   person="person_001")
+    check("a ticket is filed and named under its number",
+          said[0].speak, "Ich habe das als AIRON-90 notiert.")
+    said = box.run([Action("report", "Mikrofon fällt immer wieder aus", "nochmal")],
+                   person="person_001")
+    check("and the same fault is not filed twice", said[0].speak, NO_TICKET["de"])
+
+    twice = Toolbox(project=StubTracker(), lang="de")
+    twice.run([Action("report", "eins", "a"), Action("report", "zwei", "b")],
+              person="person_001")
+    check("one ticket per turn, however many the model asks for",
+          [f.title for f in twice.project.filed], ["eins"])
+
+    check("without a tracker it says so rather than pretending",
+          Toolbox(project=StubTracker(ready=False), lang="de").run(
+              [Action("report", "x", "y")], person="person_001")[0].speak,
+          NO_TICKET["de"])
+
+    # The boundary this ticket was scoped to. Reading the repository needs no
+    # credential; writing to it is not a thing aiRon can do at all, and the
+    # way to check that is that there is no tool for it.
+    for forbidden in ("commit", "push", "edit", "write_file", "patch",
+                      "open_pr", "merge", "run", "shell", "deploy"):
+        check(f"no tool called {forbidden}", forbidden in TOOLS, False)
+    check("nothing in the project module can write to the repository",
+          any(word in Path("airon/world/project.py").read_text()
+              for word in ('"commit"', '"push"', '"checkout"', 'subprocess.Popen',
+                           'shell=True')), False)
+
     print("\nfailing safely")
     check("an unknown tool never becomes an Action", Action.from_dict(
         {"tool": "delete_everything", "target": "*"}), None)
@@ -201,8 +271,9 @@ def main() -> int:
                       "ask_name", "stop_listening", "mute", "shutdown",
                       "forget_person", "say", "fetch", "open_url", "browse"):
         check(f"no tool called {forbidden}", forbidden in TOOLS, False)
-    check("the whole list is five tools", sorted(TOOLS),
-          ["forget", "look_at", "remember", "search", "weather"])
+    check("the whole list is seven tools", sorted(TOOLS),
+          ["forget", "look_at", "project", "remember", "report", "search",
+           "weather"])
     # The containment that matters for AIRON-26: what came back off the web
     # is read by a model that has no tools at all, so a page cannot reach
     # one however convincingly it is written.

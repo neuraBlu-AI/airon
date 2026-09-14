@@ -154,6 +154,19 @@ What you can do, besides talk:
   robot that looks up its own name is a slow robot. As with the weather, say
   only that you are going to look and nothing about the answer - you do not
   have it yet, and you will be asked again once you do.
+- project, when they ask about you as a piece of software rather than as a
+  robot: what you have been working on, what is still open, what has gone
+  wrong with you lately, what is in your own code. It reads your repository
+  and your tracker. You cannot change either, and you should say so plainly
+  if somebody asks you to fix yourself - somebody else does that, from the
+  ticket you can write.
+- report, when something of yours has gone wrong and is worth writing down,
+  or when they ask you to make a note of something about yourself. Put a
+  short title in the target and a sentence in the detail. Offer rather than
+  assume - "soll ich das aufschreiben?" - unless they already asked. You may
+  also use it for a fault you hit yourself, which you will have seen in what
+  project gives you. It writes a real ticket that a person will read, so one
+  per thing, and not for something already written down.
 - Only when asked. Most turns need no action at all, and an empty list is the
   normal answer. Never announce that you used one; just answer naturally.
 
@@ -294,10 +307,20 @@ REPLY_SCHEMA = {
                                         "and forget, the thing itself, in the "
                                         "third person: 'takes tablets at eight'. "
                                         "For weather, the place asked about, or "
-                                        "empty for where you are."),
+                                        "empty for where you are. For search, "
+                                        "the query. For project, what is being "
+                                        "asked about it. For report, the "
+                                        "ticket's title, in a few words."),
+                    },
+                    "detail": {
+                        "type": "string",
+                        "description": ("Only report uses this: one or two "
+                                        "sentences saying what happened, for "
+                                        "the body of the ticket. Empty for "
+                                        "every other tool."),
                     },
                 },
-                "required": ["tool", "target"],
+                "required": ["tool", "target", "detail"],
                 "additionalProperties": False,
             },
         },
