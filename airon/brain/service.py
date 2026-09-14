@@ -136,7 +136,7 @@ class BrainService:
     def __init__(self, bus: EventBus, *, speech=None, vision=None, face=None,
                  memory=None, conversation=None, lang: str = "en",
                  can_listen: bool = False, ears=None, listener=None, store=None,
-                 weather=None, search=None):
+                 weather=None, search=None, project=None):
         self.bus = bus
         self.speech = speech
         self.vision = vision
@@ -154,7 +154,8 @@ class BrainService:
         # actions is visible here rather than implied by what a tool happens
         # to import (AIRON-8). After self.lang, which it needs.
         self.toolbox = Toolbox(memory=memory, face=face, store=store,
-                               weather=weather, search=search, lang=self.lang)
+                               weather=weather, search=search, project=project,
+                               lang=self.lang)
 
         self._lock = threading.Lock()
         self._greeted: dict[str, float] = {}

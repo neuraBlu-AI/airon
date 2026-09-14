@@ -29,8 +29,37 @@ from __future__ import annotations
 
 import sys
 import time
+from collections import deque
 
 _START = time.monotonic()
+
+#: What a line looks like when something has gone wrong. Matched on the text
+#: rather than declared at the call site, because the alternative is thirty-
+#: five call sites growing an argument they do not otherwise need - the same
+#: reasoning that keeps the [tag] inside the message.
+#:
+#: It will over-match, and that is the right way round: a line kept that did
+#: not need keeping costs twenty characters of a ring buffer, and a line
+#: missed is a fault aiRon cannot tell anybody about (AIRON-32).
+TROUBLE = ("failed", "could not", "cannot", "error", "gave up", "giving up",
+           "no such", "stopped delivering", "went blind", "too slow",
+           "unreadable", "refused", "crash", "ignoring")
+
+#: Short on purpose. This is what aiRon can say has recently gone wrong with
+#: it, not a log file - the log file is the log file. Twenty lines is about
+#: one bad minute, which is the span somebody in the room is asking about.
+_trouble: deque[str] = deque(maxlen=20)
+
+
+def recent_trouble(limit: int = 10) -> list[str]:
+    """The last few things that went wrong, newest last.
+
+    Kept in memory only, and only for this run: aiRon noticing that its own
+    microphone dropped out two minutes ago is the point, and remembering it
+    across a restart is not - by then the thing has either been fixed or is
+    still happening, and either way it will say so again.
+    """
+    return list(_trouble)[-limit:]
 
 
 def elapsed() -> float:
@@ -40,5 +69,8 @@ def elapsed() -> float:
 
 def log(message: str, *, err: bool = False) -> None:
     """One line, stamped. `message` carries its own [tag]."""
-    print(f"{elapsed():8.2f} {message}",
-          file=sys.stderr if err else sys.stdout, flush=True)
+    stamped = f"{elapsed():8.2f} {message}"
+    lowered = message.lower()
+    if err or any(word in lowered for word in TROUBLE):
+        _trouble.append(stamped.strip())
+    print(stamped, file=sys.stderr if err else sys.stdout, flush=True)
