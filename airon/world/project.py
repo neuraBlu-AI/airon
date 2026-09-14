@@ -59,6 +59,14 @@ PROJECT_ENV = "PLANE_PROJECT_ID"
 #: Short, because this runs on the thread that talks.
 TIMEOUT_S = 6.0
 
+#: Who is calling, and it has to be said. Plane sits behind Cloudflare, which
+#: refuses urllib's default agent outright - every request came back 403 with
+#: "error code: 1010", which is Cloudflare's "banned your browser" and not
+#: anything Plane said about the key. Worth knowing because it looked exactly
+#: like a bad token and was not: neither Open-Meteo nor Tavily needs this, so
+#: the habit had never cost anything before.
+USER_AGENT = "aiRon (https://github.com/neuraBlu-AI/airon)"
+
 #: A git command that has not answered in this long has hung on something,
 #: and a robot standing silent is worse than a robot that does not know.
 GIT_TIMEOUT_S = 3.0
@@ -173,7 +181,8 @@ class Project:
         data = json.dumps(body).encode("utf-8") if body is not None else None
         request = urllib.request.Request(
             url, data=data, method="POST" if data else "GET",
-            headers={"Content-Type": "application/json", "x-api-key": self._key})
+            headers={"Content-Type": "application/json", "x-api-key": self._key,
+                     "User-Agent": USER_AGENT})
         try:
             with urllib.request.urlopen(request, timeout=TIMEOUT_S) as response:
                 return json.loads(response.read().decode("utf-8"))
